@@ -42,6 +42,8 @@ def load_strategy() -> dict:
 _market_cache: dict[str, dict[str, int]] = {}   # {wp: {good: sell_price}}
 _market_cache_ts: dict[str, float] = {}          # {wp: unix_timestamp}
 _known_markets: list[str] = []                   # grows after discover_markets()
+_good_exporters: dict[str, list[str]] = {}       # {good: [waypoints that sell it]}
+_good_buyers:    dict[str, list[str]] = {}       # {good: [waypoints that import/buy it]}
 
 _fulfill_lock = threading.Lock()                  # prevents double-fulfillment
 _manager_lock = threading.Lock()                  # serialises background fleet-management ops
@@ -325,14 +327,20 @@ def sell_junk(ship_symbol: str, keep_good: str | None = None) -> None:
     # Jettison items too cheap to be worth hauling to market
     worth_selling = []
     for item in inventory:
+        sym = item["symbol"]
         best_price = max(
-            (get_market_prices(wp).get(item["symbol"], 0) for wp in (_known_markets or [ASTEROID_BASE])),
+            (get_market_prices(wp).get(sym, 0) for wp in (_known_markets or [ASTEROID_BASE])),
             default=0,
         )
+        # Don't jettison if a known importer exists — route there to sell even without a cached price
+        if best_price < MIN_SELL_PRICE and any(
+            wp in (_known_markets or []) for wp in _good_buyers.get(sym, [])
+        ):
+            best_price = MIN_SELL_PRICE
         if best_price < MIN_SELL_PRICE:
             try:
-                fleet_api.jettison(ship_symbol, item["symbol"], item["units"])
-                log(f"[dim]Jettisoned {item['units']}x {item['symbol']} ({best_price} cr/u < threshold)[/dim]")
+                fleet_api.jettison(ship_symbol, sym, item["units"])
+                log(f"[dim]Jettisoned {item['units']}x {sym} ({best_price} cr/u < threshold)[/dim]")
             except SpaceTradersError:
                 worth_selling.append(item)  # keep if jettison fails
         else:
@@ -449,6 +457,31 @@ def discover_markets() -> list[str]:
     return _known_markets
 
 
+def scan_good_sources() -> None:
+    """Scan all known markets for exports/exchange/imports to populate _good_exporters and _good_buyers.
+    Uses the public market endpoint (no ship required) to get imports/exports lists."""
+    global _good_exporters, _good_buyers
+    _good_exporters = {}
+    _good_buyers = {}
+    for wp in (_known_markets or [ASTEROID_BASE]):
+        try:
+            data = universe_api.get_market(SYSTEM, wp)
+            for category in ("exports", "exchange"):
+                for g in data.get(category, []):
+                    sym = g.get("symbol", "")
+                    if sym:
+                        _good_exporters.setdefault(sym, []).append(wp)
+            for g in data.get("imports", []):
+                sym = g.get("symbol", "")
+                if sym:
+                    _good_buyers.setdefault(sym, []).append(wp)
+        except SpaceTradersError:
+            pass
+        time.sleep(0.4)  # throttle to avoid 429 bursts
+    if _good_exporters:
+        log(f"[dim]Good sources: {len(_good_exporters)} goods indexed, {len(_good_buyers)} buyable goods across {len(_known_markets)} markets[/dim]")
+
+
 def get_market_prices(waypoint: str) -> dict[str, int]:
     """Return {trade_symbol: sell_price} for a waypoint. Results are cached."""
     now = time.time()
@@ -459,9 +492,12 @@ def get_market_prices(waypoint: str) -> dict[str, int]:
         prices = {g["symbol"]: g["sellPrice"] for g in data.get("tradeGoods", [])}
         # Also store buy prices under a buy_ prefix for purchasing decisions
         buy = {f"_buy_{g['symbol']}": g["purchasePrice"] for g in data.get("tradeGoods", [])}
-        _market_cache[waypoint] = {**prices, **buy}
+        # Only overwrite cache if we actually got price data (tradeGoods requires ship present).
+        # Preserving last-known prices avoids zeroing out H51/H53 when called without a ship.
+        if prices or buy:
+            _market_cache[waypoint] = {**prices, **buy}
         _market_cache_ts[waypoint] = now
-        return prices
+        return _market_cache.get(waypoint, {})
     except SpaceTradersError:
         return {k: v for k, v in _market_cache.get(waypoint, {}).items() if not k.startswith("_buy_")}
 
@@ -476,6 +512,22 @@ def best_sell_waypoint(good: str) -> tuple[str, int]:
     return best_wp, best_price
 
 
+def best_buy_waypoint(good: str) -> str:
+    """Return the waypoint that exports/exchanges `good` (i.e. sells it to us).
+    Prefers markets with a known price; falls back to any exporter in _good_exporters."""
+    # First pass: prefer markets with a live price already in cache
+    best_wp, best_price = "", 0
+    for wp in _good_exporters.get(good, []):
+        price = _market_cache.get(wp, {}).get(f"_buy_{good}", 0)
+        if price > 0 and (best_price == 0 or price < best_price):
+            best_price, best_wp = price, wp
+    if best_wp:
+        return best_wp
+    # Fallback: return any known exporter (price unknown, will be revealed on arrival)
+    exporters = _good_exporters.get(good, [])
+    return exporters[0] if exporters else ""
+
+
 def best_sell_market_for_cargo(inventory: list[dict]) -> str:
     """
     Given a list of cargo items, return the waypoint with the highest aggregate
@@ -485,6 +537,9 @@ def best_sell_market_for_cargo(inventory: list[dict]) -> str:
     for item in inventory:
         for wp in (_known_markets or [ASTEROID_BASE]):
             price = get_market_prices(wp).get(item["symbol"], 0)
+            # If no cached price, treat known importers as viable (will get real price on arrival)
+            if price == 0 and wp in _good_buyers.get(item["symbol"], []):
+                price = MIN_SELL_PRICE
             market_values[wp] = market_values.get(wp, 0) + price * item["units"]
 
     if not market_values:
@@ -792,6 +847,7 @@ def miner_loop(
     navigate_with_refuel(ship_symbol, ASTEROID)
     ensure_orbit(ship_symbol)
     active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
+    _empty_loads = 0  # consecutive full cargo loads with 0 contract good
 
     while not stop_event.is_set() and not contract_done.is_set():
         # Refresh active_survey from shared pool if we don't have one
@@ -827,6 +883,7 @@ def miner_loop(
             have = good_in_cargo(ship_symbol, good)
 
             if have > 0 and not contract_done.is_set():
+                _empty_loads = 0
                 # Refuel at ASTEROID_BASE before the long delivery trip to maximize fuel
                 navigate_to(ship_symbol, ASTEROID_BASE)
                 ensure_docked(ship_symbol)
@@ -863,11 +920,44 @@ def miner_loop(
                     navigate_to(ship_symbol, ASTEROID)
                     ensure_orbit(ship_symbol)
             else:
-                # No contract good — dump junk and return
+                # No contract good in cargo — junk run, then optionally buy the good
+                _empty_loads += 1
                 navigate_to(ship_symbol, ASTEROID_BASE)
                 ensure_docked(ship_symbol)
                 refuel_if_needed(ship_symbol, threshold=100_000)  # always fill to max
                 sell_junk(ship_symbol, good)
+
+                if _empty_loads >= 2 and not contract_done.is_set():
+                    _buy_wp = best_buy_waypoint(good)
+                    if _buy_wp:
+                        log(f"[cyan]{ship_symbol}: {_empty_loads} empty loads — switching to buy {good} from {_buy_wp}[/cyan]")
+                        navigate_with_refuel(ship_symbol, _buy_wp)
+                        ensure_docked(ship_symbol)
+                        _market_cache_ts.pop(_buy_wp, None)  # force fresh query while docked
+                        get_market_prices(_buy_wp)  # populate cache (needs ship present)
+                        _buy_price = _market_cache.get(_buy_wp, {}).get(f"_buy_{good}", 0)
+                        if _buy_price > 0:
+                            _me = agent_api.get_my_agent()
+                            _ship_now = fleet_api.get_ship(ship_symbol)
+                            _free = _ship_now["cargo"]["capacity"] - _ship_now["cargo"]["units"]
+                            _affordable = max(0, (_me["credits"] - CREDIT_RESERVE) // _buy_price)
+                            _to_buy = min(_free, _affordable)
+                            if _to_buy > 0:
+                                try:
+                                    result = fleet_api.purchase_cargo(ship_symbol, good, _to_buy)
+                                    ag = result.get("agent", {})
+                                    tx = result.get("transaction", {})
+                                    log(f"[green]🛒 {ship_symbol}: bought {_to_buy}x {good} @ {_buy_price:,} cr/u | total {tx.get('totalPrice',0):,} cr | Credits: {ag.get('credits',0):,}[/green]")
+                                    _empty_loads = 0
+                                    continue  # cargo now has the good — deliver path fires next iteration
+                                except SpaceTradersError as e:
+                                    log(f"[yellow]{ship_symbol}: purchase failed: {e}[/yellow]")
+                            else:
+                                _affordable_str = f"{_affordable}u affordable" if _buy_price > 0 else "price unknown"
+                                log(f"[yellow]{ship_symbol}: can't buy {good} — {_affordable_str} (credits: {_me['credits']:,}, reserve: {CREDIT_RESERVE:,})[/yellow]")
+                        else:
+                            log(f"[yellow]{ship_symbol}: {good} not found in {_buy_wp} tradeGoods (no ship visit yet?)[/yellow]")
+
                 navigate_to(ship_symbol, ASTEROID)
                 ensure_orbit(ship_symbol)
             continue
@@ -1370,6 +1460,7 @@ def run() -> None:
 
     # Discover all markets in the system on startup
     discover_markets()
+    scan_good_sources()
 
     loop = 0
     while True:

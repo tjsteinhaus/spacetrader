@@ -298,6 +298,31 @@ waiting for the surveyor to arrive.
 `fulfill_contract()` under a `_fulfill_lock`. It then sets `contract_done`. All other
 miners and the fleet manager see this event and exit their loops.
 
+**Buy-from-market fallback (`_empty_loads`):** Some contract goods (e.g. ALUMINUM)
+never drop from asteroid mining — only the ore variant (ALUMINUM_ORE) does. Refined
+metals must be purchased from a market. The miner tracks consecutive full cargo loads
+with zero contract good using `_empty_loads`. After 2 such loads it switches to the
+buy path:
+
+```
+1. Check _good_exporters for a market that sells the contract good
+2. Navigate to that market (best_buy_waypoint)
+3. Bust the market cache (force fresh API call while docked)
+4. Read purchase price from cache
+5. Buy as many units as: min(free_cargo, affordable_with_reserve)
+6. Navigate to delivery waypoint and deliver
+7. Reset _empty_loads = 0, continue mining
+```
+
+**Why bust the cache before buying?** `best_sell_waypoint` is called for all 29 markets
+while the ship is at H52 (not H51). Without a ship at H51, the API returns empty
+`tradeGoods`, which would zero out the H51 cache. By calling
+`_market_cache_ts.pop(_buy_wp, None)` before `get_market_prices(_buy_wp)`, we force
+a fresh API call while the ship is actually docked — guaranteeing real prices.
+
+In X1-HU91, ALUMINUM is bought from **H51** at ~159 cr/unit (exports it). H51 is at
+(36, 27) — same location as H52, ~15s hop.
+
 ---
 
 ### Surveyor Loop
@@ -407,13 +432,34 @@ and keeps cargo space available for valuable minerals.
 _market_cache: dict[str, dict[str, int]] = {}
 _market_cache_ts: dict[str, float] = {}
 MARKET_CACHE_TTL = 600  # 10 minutes
+_good_exporters: dict[str, list[str]] = {}  # markets that sell a good (exports + exchange)
+_good_buyers:    dict[str, list[str]] = {}  # markets that buy a good (imports)
 ```
 
 **`get_market_prices(waypoint)`** returns `{trade_symbol: sell_price}` from cache,
 refreshing via API if the cache is stale (>10 min old).
 
-The cache also stores buy prices under `_buy_` prefixed keys for potential future
-arbitrage use.
+The SpaceTraders API only returns `tradeGoods` (with prices) when a ship is physically
+docked at the waypoint. Without a ship present the API returns only
+`imports`/`exports`/`exchange` category lists (no prices). **Critical fix:** the cache
+is only overwritten when real price data is returned. If `tradeGoods` is empty (no
+ship present), the existing cached prices are preserved. This prevents a scenario where
+`sell_junk` calls `get_market_prices` for all 29 markets from a ship docked at H52,
+gets empty data for H51/H53 (no ship there), and overwrites valid cached prices with
+`{}` — causing ore to be jettisoned even though H51 imports it.
+
+The cache also stores buy prices under `_buy_` prefixed keys, used by the
+buy-from-market path.
+
+**`scan_good_sources()`** runs at startup after `discover_markets()`. Calls the public
+market endpoint for all 29 known markets (no ship required) and builds two dicts:
+- `_good_exporters` — which markets export or exchange each good (used by `best_buy_waypoint`)
+- `_good_buyers` — which markets import each good (used by `sell_junk` to route ore sales)
+
+In X1-HU91, key buyers discovered:
+- **H51** (same coordinates as H52, ~15s hop): imports ALUMINUM_ORE, COPPER_ORE, IRON_ORE
+- **H53** (same coordinates as H52, ~15s hop): exchange for ICE_WATER, QUARTZ_SAND, SILICON_CRYSTALS
+- **B7** (312 units away): exchange for all mined goods — too far for routine selling
 
 **`discover_markets()`** runs at startup: scans all waypoints in the system for the
 `MARKETPLACE` trait and populates `_known_markets`. This prevents hard-coding market
@@ -521,6 +567,12 @@ A record of specific choices made during development and why.
 | `negotiate_contract` dock bug | `ensure_orbit` before negotiating | `ensure_docked` | SpaceTraders API requires ship to be DOCKED to negotiate (error 4244). Was orbiting instead |
 | `strategy.json` | (didn't exist) | Mode + notes + target contract | Shared state file lets the MCP advisor override script behavior without code changes. Modes: `contract_grind`, `fleet_expansion`, `upgrade_first`, `idle` |
 | MCP server | (didn't exist) | `mcp_server.py` with 8 tools | Exposes game state and strategy to AI advisor via VS Code MCP integration. Tools: `get_situation`, `get_market_prices`, `get_shipyard`, `analyze_contract_value`, `get_upgrade_analysis`, `get_strategy`, `set_strategy`, `negotiate_new_contract` |
+| Rate limit retry (429) | Only retried on `Timeout`/`ConnectionError` | Also retries on `SpaceTradersError(code=429)` with exponential backoff | When `scan_good_sources()` made 29 rapid API calls at startup, all 4 miner threads received 429 and crashed. Fix in `client.py`: retry 429 with same backoff as network errors |
+| `get_market_prices` cache overwrite | Always wrote `{}` if `tradeGoods` empty | Only overwrites cache when `tradeGoods` is non-empty | Remote API calls without a ship return empty `tradeGoods`. Writing `{}` to cache erased valid H51 prices from a previous docked visit, causing ore to be jettisoned on the next cycle |
+| Market cache bust before buying | `get_market_prices(_buy_wp)` used stale cache | `_market_cache_ts.pop(_buy_wp, None)` before the call | `sell_junk` (called at H52) refreshed H51 cache with empty data ~11 min after last H51 visit. 54s later when TM-1 arrived at H51, TTL hadn't expired → cache returned `{}` → `_buy_ALUMINUM = 0` → buy skipped |
+| Ore jettisoned at H52 | All ORE < MIN_SELL_PRICE → jettisoned | Check `_good_buyers`; route to H51/H53 if importer known | H51 and H53 are at (36,27) — same coordinates as H52. H51 imports ALUMINUM_ORE/COPPER_ORE/IRON_ORE; H53 trades ICE_WATER/QUARTZ_SAND/SILICON_CRYSTALS. Zero extra travel cost, significant revenue per cycle |
+| `scan_good_sources` | Only scanned `exports` + `exchange` | Also scans `imports` → populates `_good_buyers` | `_good_buyers` needed to know where to sell ore without cached prices. Also added to log: `"48 goods indexed, 42 buyable goods"` |
+| `_good_exporters` / buy path | (didn't exist) | `scan_good_sources()` + `best_buy_waypoint()` + `_empty_loads` counter | ALUMINUM never drops from COMMON_METAL_DEPOSITS — only ALUMINUM_ORE does. After 2 empty mining loads, miners switch to buying ALUMINUM from H51 (exports it) and delivering directly |
 
 ---
 

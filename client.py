@@ -67,6 +67,12 @@ def _request_with_retry(method: str, path: str, *, params=None, json=None, token
                 timeout=30,
             )
             return _handle_response(resp)
+        except SpaceTradersError as e:
+            if e.code == 429 and attempt < retries - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            raise
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             if attempt < retries - 1:
                 time.sleep(delay)
