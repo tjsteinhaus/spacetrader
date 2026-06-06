@@ -9,22 +9,41 @@
 
 ## Table of Contents
 
-1. [What the Script Does](#what-the-script-does)
-2. [Architecture Overview](#architecture-overview)
-3. [Configuration Reference](#configuration-reference)
-4. [Component Deep-Dives](#component-deep-dives)
-   - [Main Loop](#main-loop)
-   - [Contract Sourcing](#contract-sourcing)
-   - [Miner Loop](#miner-loop)
-   - [Surveyor Loop](#surveyor-loop)
-   - [Fleet Manager](#fleet-manager)
-   - [Sell Junk & Jettison Logic](#sell-junk--jettison-logic)
-   - [Market Intelligence](#market-intelligence)
-   - [Navigation](#navigation)
-   - [Repair System](#repair-system)
-   - [Upgrade System](#upgrade-system)
-5. [Decision Log](#decision-log)
-6. [Rebuild Plan](#rebuild-plan)
+- [SpaceTraders Automation Playbook](#spacetraders-automation-playbook)
+  - [Table of Contents](#table-of-contents)
+  - [What the Script Does](#what-the-script-does)
+  - [Architecture Overview](#architecture-overview)
+  - [Configuration Reference](#configuration-reference)
+    - [Waypoints](#waypoints)
+    - [Ships](#ships)
+    - [Economics](#economics)
+    - [Ship Purchase Priority](#ship-purchase-priority)
+    - [Repair \& Upgrades](#repair--upgrades)
+  - [Component Deep-Dives](#component-deep-dives)
+    - [Main Loop](#main-loop)
+    - [Contract Sourcing](#contract-sourcing)
+    - [Miner Loop](#miner-loop)
+    - [Surveyor Loop](#surveyor-loop)
+    - [Fleet Manager](#fleet-manager)
+    - [Sell Junk \& Jettison Logic](#sell-junk--jettison-logic)
+    - [Market Intelligence](#market-intelligence)
+    - [Navigation](#navigation)
+    - [Repair System](#repair-system)
+    - [Upgrade System](#upgrade-system)
+  - [Decision Log](#decision-log)
+  - [Rebuild Plan](#rebuild-plan)
+    - [Step 1 — Environment Setup](#step-1--environment-setup)
+    - [Step 2 — SpaceTraders Account](#step-2--spacetraders-account)
+    - [Step 3 — Identify Your Starting System](#step-3--identify-your-starting-system)
+    - [Step 4 — Find Your Asteroid \& Markets](#step-4--find-your-asteroid--markets)
+    - [Step 5 — Update Config in `play.py`](#step-5--update-config-in-playpy)
+    - [Step 6 — Get Your Second Ship](#step-6--get-your-second-ship)
+    - [Step 7 — Run the Script](#step-7--run-the-script)
+    - [Step 8 — What to Watch For](#step-8--what-to-watch-for)
+    - [Step 9 — Key First-Day Priority](#step-9--key-first-day-priority)
+    - [Strategy File](#strategy-file)
+    - [MCP Server](#mcp-server)
+    - [Module Summary](#module-summary)
 
 ---
 
@@ -90,13 +109,21 @@ All tunable constants live at the top of `play.py`. Change these before a new ru
 | Constant | Value | What It Is |
 |---|---|---|
 | `SYSTEM` | `X1-HU91` | The star system we're operating in |
-| `ASTEROID` | `X1-HU91-B8` | COMMON_METAL_DEPOSITS — where we mine |
-| `ASTEROID_BASE` | `X1-HU91-B7` | Nearest market to the asteroid; sells ores, fuel |
-| `SHIPYARD_WP` | `X1-HU91-H52` | Moon with a SHIPYARD; where we buy ships |
+| `ASTEROID` | `X1-HU91-FD5D` | ENGINEERED_ASTEROID with COMMON_METAL_DEPOSITS + on-site FUEL exchange |
+| `ASTEROID_BASE` | `X1-HU91-H52` | Nearest full market to the asteroid; MARKETPLACE + SHIPYARD |
+| `SHIPYARD_WP` | `X1-HU91-H52` | Same moon — used for repairs and upgrades |
+| `SHIPYARD_WPS` | `[H52, A2]` | All known shipyards; fleet manager checks both when buying ships |
 
-**Why X1-HU91-B8?** It's a COMMON_METAL_DEPOSITS asteroid, which means it yields
-COPPER_ORE, IRON_ORE, ALUMINUM_ORE and other metals — exactly what mining contracts
-ask for. The proximity to ASTEROID_BASE (B7) keeps travel time short.
+**Why X1-HU91-FD5D?** A full system scan (85 waypoints) revealed FD5D is an
+ENGINEERED_ASTEROID at the center cluster (-2, 26). Key advantages over B8 (old
+site at +350 units away):
+- K84 (contract delivery) is only 127 units from FD5D vs 408 units from B8 — 3× closer
+- FD5D has an on-site FUEL exchange (no need to leave for basic refueling)
+- H52 is 38 units away (MARKETPLACE + SHIPYARD) vs B7 at 195 units
+- ENGINEERED_ASTEROIDs yield a wider range of goods including refined metals
+
+B8 (old site) was COMMON_METAL_DEPOSITS and yielded only ALUMINUM_ORE, never
+refined ALUMINUM — contracts for ALUMINUM were impossible to complete from B8.
 
 ### Ships
 
@@ -116,7 +143,8 @@ HQ to pre-negotiate contracts.
 |---|---|---|
 | `CREDIT_RESERVE` | `30_000` | Never spend below this floor — keeps us solvent for fuel + repairs |
 | `MIN_SELL_PRICE` | `30` | cr/unit threshold below which cargo is jettisoned, not hauled |
-| `MIN_FUEL_CAPACITY` | `200` | Ships with tiny tanks can't reach B7↔B8↔H51 and back |
+| `MIN_FUEL_CAPACITY` | `200` | Ships with tiny tanks can't reach FD5D↔H52↔K84 reliably |
+| `MIN_BUY_CREDITS` | `120_000` | Fleet manager won't even navigate to the shipyard below this — prevents constant fruitless trips when credits are low |
 
 **Why 30k reserve?** At 30k we can still afford: fuel for all ships (~400 cr each
 fill), emergency repairs, and at least partial contract delivery. At 50k (the old
@@ -124,10 +152,15 @@ value) we blocked ship purchases because SURVEYOR costs 32,918 cr — we'd need 
 credits just to buy the cheapest useful ship.
 
 **Why MIN_SELL_PRICE = 30?** ICE_WATER sells for 13 cr/unit and QUARTZ_SAND for 18
-cr/unit. A round-trip from asteroid B8 to market B7 takes ~2 minutes. Mining 10 units
-of ICE_WATER earns 130 cr but costs fuel and time that could be spent mining copper
-(worth 400-600 cr per load). Jettisoning at the asteroid recovers cargo space
+cr/unit. A round-trip from asteroid FD5D to market H52 takes ~4 minutes. Mining 10
+units of ICE_WATER earns 130 cr but costs fuel and time that could be spent mining
+metals (worth 400-600 cr per load). Jettisoning at the asteroid recovers cargo space
 immediately and lets the miner stay productive.
+
+**Why MIN_BUY_CREDITS = 120,000?** The fleet manager used to navigate to the shipyard
+every 2 minutes regardless of credits, wasting fuel and API calls. At 120k we can
+afford the cheapest useful ship (SHIP_LIGHT_SHUTTLE ~86k at A2) and still have the
+30k reserve. Below that, the manager parks at A1 idle.
 
 ### Ship Purchase Priority
 
@@ -249,9 +282,13 @@ Each miner runs this loop independently:
    f. Repeat
 ```
 
-**The delivery detour:** Before the long trip to H51 (delivery destination), the miner
-always stops at ASTEROID_BASE (B7) to refuel. This ensures it never runs out of fuel
+**The delivery detour:** Before the long trip to the delivery destination, the miner
+always stops at ASTEROID_BASE (H52) to refuel. This ensures it never runs out of fuel
 mid-delivery. After delivery it refuels again at the nearest market before returning.
+
+**Preflight fuel check:** At startup, ships only navigate to H52 for a preflight
+refuel if they are *not* already at the mining cluster AND have less than 50% fuel.
+Using `and` (not `or`) prevents ships at FD5D from making unnecessary refuel trips.
 
 **Survey fallback:** If the shared survey pool is empty, the miner calls `try_survey()`
 itself. This is slower (uses its own cooldown) but keeps it from mining blindly while
@@ -380,7 +417,11 @@ arbitrage use.
 
 **`discover_markets()`** runs at startup: scans all waypoints in the system for the
 `MARKETPLACE` trait and populates `_known_markets`. This prevents hard-coding market
-waypoints and adapts to different systems.
+waypoints and adapts to different systems. The system has 85 waypoints across 5 pages
+— the function paginates manually using raw `requests` calls to avoid the
+`client.get()` wrapper which strips the `meta.total` field needed for pagination.
+Without this fix, only the first 20 waypoints were scanned and 25 of 29 markets
+were missed.
 
 ---
 
@@ -408,6 +449,7 @@ Handles both intra-system and inter-system travel:
 - Short transits (<120s remaining): polls every 5 seconds
 - Long transits (>120s remaining): polls every 30 seconds, logs once per minute
 - Prevents console spam during the 1.5+ hour transit for newly purchased ships
+- ETA display: `~4m 5s` for >60s, `~1h 29m` for >1h, `~45s` for short hops
 
 **`nearest_refuel_point(from_wp)`** — finds the closest known market using Euclidean
 distance on waypoint coordinates. Used so ships don't make unnecessarily long detours
@@ -469,6 +511,16 @@ A record of specific choices made during development and why.
 | `sell_junk()` | Hauled everything to market | Jettison below threshold | Same as above — saves 2 min round-trip per haul cycle of worthless cargo |
 | Dead code in `work_contract()` | Called `step_mine_contract()` / `step_deliver_contract()` | Removed | These functions don't exist anywhere in the file. Would cause NameError if contract reached end of delivery loop |
 | Fleet manager contract negotiation | COMMAND_SHIP diverted to negotiate | FLEET_MANAGER_SHIP pre-negotiates in background | Keeps command ship mining; next contract ready before current one finishes |
+| `ASTEROID` | `X1-HU91-B8` (COMMON_METAL_DEPOSITS) | `X1-HU91-FD5D` (ENGINEERED_ASTEROID) | B8 only yields ores; never dropped refined ALUMINUM needed for contracts. FD5D is 3× closer to K84 delivery point and yields refined metals. Full system map (85 WPs) revealed this |
+| `ASTEROID_BASE` | `X1-HU91-B7` (350 units from FD5D) | `X1-HU91-H52` (38 units from FD5D) | H52 has MARKETPLACE + SHIPYARD and is the closest full-service base to the new asteroid |
+| `MIN_BUY_CREDITS` | (didn't exist — always attempted) | 120,000 | Fleet manager was bouncing to shipyard every 2 min with ~60k credits, wasting fuel. Parks idle at A1 until 120k |
+| `SHIPYARD_WPS` | `[H52]` single shipyard | `[H52, A2]` | A2 has SHIP_LIGHT_SHUTTLE at 86,575 cr — cheaper than H52 options. Looping multiple shipyards finds the best deal |
+| Market pagination | `universe_api.get_waypoints()` (only returned first 20) | Raw paginated requests in `discover_markets()` | `client.get()` strips the `meta` envelope, breaking the pagination loop in `universe.py`. Fix: paginate directly. Result: 29 markets found vs 4 before |
+| Transit log format | `~{secs}s` always | `~Xm Ys` / `~Xh Ym` | Long drifts (30+ min) logged as `~1820s` — unreadable. Now shows `~30m 20s` or `~1h 29m` |
+| Preflight fuel check | `if not at_asteroid OR fuel < 50%` | `if not at_asteroid AND fuel < 50%` | OR logic triggered refuel even when ship was already at FD5D with full tank. AND only triggers when both conditions are true |
+| `negotiate_contract` dock bug | `ensure_orbit` before negotiating | `ensure_docked` | SpaceTraders API requires ship to be DOCKED to negotiate (error 4244). Was orbiting instead |
+| `strategy.json` | (didn't exist) | Mode + notes + target contract | Shared state file lets the MCP advisor override script behavior without code changes. Modes: `contract_grind`, `fleet_expansion`, `upgrade_first`, `idle` |
+| MCP server | (didn't exist) | `mcp_server.py` with 8 tools | Exposes game state and strategy to AI advisor via VS Code MCP integration. Tools: `get_situation`, `get_market_prices`, `get_shipyard`, `analyze_contract_value`, `get_upgrade_analysis`, `get_strategy`, `set_strategy`, `negotiate_new_contract` |
 
 ---
 
@@ -539,11 +591,13 @@ Look for:
 ```python
 SYSTEM          = "X1-XXXX"         # your system
 COMMAND_SHIP    = "YOURAGENT-1"      # your first ship symbol
-ASTEROID        = "X1-XXXX-B8"      # COMMON_METAL_DEPOSITS asteroid
-ASTEROID_BASE   = "X1-XXXX-B7"      # nearest market to asteroid
-SHIPYARD_WP     = "X1-XXXX-H52"     # shipyard waypoint
+ASTEROID        = "X1-XXXX-FD5D"    # ENGINEERED_ASTEROID (center cluster preferred)
+ASTEROID_BASE   = "X1-XXXX-H52"     # nearest market to asteroid (MARKETPLACE + SHIPYARD)
+SHIPYARD_WP     = "X1-XXXX-H52"     # shipyard waypoint (often same as ASTEROID_BASE)
+SHIPYARD_WPS    = ["X1-XXXX-H52", "X1-XXXX-A2"]  # all known shipyards
 FLEET_MANAGER_SHIP = "YOURAGENT-2"  # second ship (non-miner)
 CREDIT_RESERVE  = 30_000
+MIN_BUY_CREDITS = 120_000
 MIN_SELL_PRICE  = 30
 ```
 
@@ -552,6 +606,14 @@ Also update the hardcoded `"X1-HU91-A1"` in two places:
 - `_bg_negotiate_contract()` (line ~940)
 
 Replace both with your faction HQ waypoint.
+
+**Finding the best asteroid:** Run a full system waypoint scan (all pages), then look for:
+- `ENGINEERED_ASTEROID` type with `COMMON_METAL_DEPOSITS` trait — these yield refined metals
+- Compare distance from the asteroid to your contract delivery waypoints
+- Prefer asteroids with nearby markets (within 50 units) to keep round-trip time low
+
+The `discover_markets()` function does this automatically at startup — check its output
+to find the 29+ markets and identify the best cluster.
 
 ### Step 6 — Get Your Second Ship
 
@@ -606,14 +668,67 @@ During that time:
 - 4-6 hrs: enough credits to buy MINING_DRONE (~42k) or SURVEYOR (~33k) — fleet grows
 - 12+ hrs: fleet of 6-8 ships running concurrently
 
+### Strategy File
+
+`strategy.json` is a shared state file that lets the MCP advisor (or manual edits)
+influence script behavior without restarting:
+
+```json
+{
+  "mode": "contract_grind",
+  "notes": "Human-readable description of current goal",
+  "target_contract_id": null
+}
+```
+
+**Modes:**
+
+| Mode | Behavior |
+|---|---|
+| `contract_grind` | Normal operation — mine and deliver contracts |
+| `fleet_expansion` | Prioritize buying ships; skip upgrades to preserve credits |
+| `upgrade_first` | Skip ship purchases until upgrades are installed |
+| `idle` | Pause all mining; main loop sleeps 60s between checks |
+
+The main loop reads `strategy.json` at the top of every iteration. Changes take
+effect on the next loop (after the current contract finishes), not mid-contract.
+
+---
+
+### MCP Server
+
+`mcp_server.py` exposes game state to an AI advisor via VS Code's MCP integration.
+Registered in `.vscode/mcp.json` as `spacetraders-advisor`.
+
+**Available tools:**
+
+| Tool | What It Does |
+|---|---|
+| `get_situation()` | Credits, ships, active contract, delivery progress |
+| `get_market_prices(waypoint)` | Live market prices at a waypoint |
+| `get_shipyard(waypoint)` | Available ships and prices at a shipyard |
+| `analyze_contract_value()` | cr/hr estimate for current contract |
+| `get_upgrade_analysis()` | Which ships can be upgraded and cost |
+| `get_strategy()` | Read current strategy.json |
+| `set_strategy(mode, notes)` | Write new strategy (affects next loop) |
+| `negotiate_new_contract()` | Trigger FLEET_MANAGER_SHIP to negotiate |
+
+The MCP server is read-only for most tools and only mutates `strategy.json` via
+`set_strategy`. It does not directly control ship movements.
+
+---
+
 ### Module Summary
 
 | File | Purpose |
 |---|---|
 | `play.py` | Main script — all logic lives here |
-| `client.py` | HTTP client; handles auth header, pagination, rate limiting |
+| `client.py` | HTTP client; handles auth header, rate limiting |
 | `fleet.py` | Thin wrappers for ship endpoints (navigate, dock, extract, survey, etc.) |
 | `contracts.py` | Contract endpoints (get, accept, deliver, fulfill) |
-| `universe.py` | Universe endpoints (waypoints, markets, shipyards) |
+| `universe.py` | Universe endpoints (waypoints, markets, shipyards) — pagination fixed |
 | `agent.py` | Agent endpoints (get credits, agent info) |
+| `mcp_server.py` | MCP server exposing game state to AI advisor |
+| `strategy.json` | Shared state file; controls script mode between loops |
+| `.vscode/mcp.json` | Registers `spacetraders-advisor` MCP server in VS Code |
 | `.env` | `SPACETRADERS_TOKEN=...` — never commit this |
