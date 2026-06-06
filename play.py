@@ -238,6 +238,65 @@ def navigate_to(ship_symbol: str, destination: str) -> None:
     wait_for_ship(ship_symbol)
 
 
+def navigate_with_refuel(ship_symbol: str, destination: str) -> None:
+    """
+    Navigate to destination, making intermediate refuel stops when the ship
+    doesn't have enough fuel to reach it in one CRUISE hop.
+
+    At each step, finds the best reachable market (within fuel capacity) that
+    makes progress toward the destination. Falls back to a direct navigate_to
+    (which will drift if needed) if no intermediate market can be found.
+    """
+    for _hop in range(10):
+        ship = fleet_api.get_ship(ship_symbol)
+        cur_wp = ship["nav"]["waypointSymbol"]
+        if cur_wp == destination:
+            return
+
+        fuel = ship["fuel"]
+        cur_fuel = fuel.get("current", 0)
+        fuel_cap = max(fuel.get("capacity", 1), 1)
+
+        cx, cy = _get_coords(cur_wp)
+        dx, dy = _get_coords(destination)
+        dist_to_dest = ((dx - cx) ** 2 + (dy - cy) ** 2) ** 0.5
+
+        if cur_fuel >= dist_to_dest:
+            navigate_to(ship_symbol, destination)
+            return
+
+        # Find the best reachable market: within fuel_cap of current position
+        # and closer to the destination than we currently are.
+        markets = _known_markets or [ASTEROID_BASE]
+        best_wp: str | None = None
+        best_remaining = dist_to_dest  # must beat our current distance
+
+        for wp in markets:
+            if wp == cur_wp:
+                continue
+            wx, wy = _get_coords(wp)
+            hop_dist = ((wx - cx) ** 2 + (wy - cy) ** 2) ** 0.5
+            if hop_dist > fuel_cap:
+                continue  # unreachable even at full tank
+            remaining = ((dx - wx) ** 2 + (dy - wy) ** 2) ** 0.5
+            if remaining < best_remaining:
+                best_remaining = remaining
+                best_wp = wp
+
+        if best_wp is None:
+            log(f"[yellow]{ship_symbol}: no reachable intermediate market en route to {destination} — will drift[/yellow]")
+            navigate_to(ship_symbol, destination)
+            return
+
+        log(f"[dim]{ship_symbol}: refuel hop → {best_wp} (en route to {destination})[/dim]")
+        navigate_to(ship_symbol, best_wp)
+        ensure_docked(ship_symbol)
+        refuel_if_needed(ship_symbol, threshold=100_000)
+
+    # Reached hop limit — attempt direct (may drift)
+    navigate_to(ship_symbol, destination)
+
+
 def good_in_cargo(ship_symbol: str, good: str) -> int:
     ship = fleet_api.get_ship(ship_symbol)
     for item in ship["cargo"].get("inventory", []):
@@ -658,7 +717,7 @@ def surveyor_loop(
         ensure_docked(ship_symbol)
         refuel_if_needed(ship_symbol, threshold=100_000)
 
-    navigate_to(ship_symbol, ASTEROID)
+    navigate_with_refuel(ship_symbol, ASTEROID)
     ensure_orbit(ship_symbol)
 
     while not stop_event.is_set() and not contract_done.is_set():
@@ -669,10 +728,10 @@ def surveyor_loop(
         _sv_at_asteroid = _sv_ship["nav"].get("waypointSymbol") == ASTEROID
         if not _sv_at_asteroid and _sv_fuel.get("capacity", 0) > 0 and _sv_fuel["current"] / _sv_fuel["capacity"] < 0.50:
             log(f"[yellow]⛽ {ship_symbol} surveyor: fuel low, topping up[/yellow]")
-            navigate_to(ship_symbol, ASTEROID_BASE)
+            navigate_with_refuel(ship_symbol, ASTEROID_BASE)
             ensure_docked(ship_symbol)
             refuel_if_needed(ship_symbol, threshold=100_000)
-            navigate_to(ship_symbol, ASTEROID)
+            navigate_with_refuel(ship_symbol, ASTEROID)
             ensure_orbit(ship_symbol)
 
         if stop_event.is_set() or contract_done.is_set():
@@ -726,11 +785,11 @@ def miner_loop(
     _fuel_pct0 = _f0["current"] / max(_f0["capacity"], 1) if _f0.get("capacity", 0) > 0 else 1.0
     if _wp0 not in (ASTEROID, ASTEROID_BASE) and _fuel_pct0 < 0.50:
         log(f"[dim]{ship_symbol}: preflight refuel at {ASTEROID_BASE} (wp={_wp0}, fuel={_f0['current']}/{_f0['capacity']})[/dim]")
-        navigate_to(ship_symbol, ASTEROID_BASE)
+        navigate_with_refuel(ship_symbol, ASTEROID_BASE)
         ensure_docked(ship_symbol)
         refuel_if_needed(ship_symbol, threshold=100_000)  # fill to max
 
-    navigate_to(ship_symbol, ASTEROID)
+    navigate_with_refuel(ship_symbol, ASTEROID)
     ensure_orbit(ship_symbol)
     active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
 
@@ -747,10 +806,10 @@ def miner_loop(
         # let small ships (80-cap) mine a full load before drifting back to B7.
         if not _at_asteroid and _fuel.get("capacity", 0) > 0 and _fuel["current"] / _fuel["capacity"] < 0.40:
             log(f"[yellow]⛽ {ship_symbol}: fuel low ({_fuel['current']}/{_fuel['capacity']}), topping up[/yellow]")
-            navigate_to(ship_symbol, ASTEROID_BASE)
+            navigate_with_refuel(ship_symbol, ASTEROID_BASE)
             ensure_docked(ship_symbol)
             refuel_if_needed(ship_symbol, threshold=100_000)  # fill to max
-            navigate_to(ship_symbol, ASTEROID)
+            navigate_with_refuel(ship_symbol, ASTEROID)
             ensure_orbit(ship_symbol)
             active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
 
@@ -759,7 +818,7 @@ def miner_loop(
             _cond = min(_condition(_loop_ship.get(c, {})) for c in ("frame", "engine", "reactor"))
             log(f"[yellow]🔧 {ship_symbol}: condition {_cond:.0%} below threshold — diverting to repair[/yellow]")
             repair_ship(ship_symbol)
-            navigate_to(ship_symbol, ASTEROID)
+            navigate_with_refuel(ship_symbol, ASTEROID)
             ensure_orbit(ship_symbol)
             active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
 
