@@ -1197,10 +1197,18 @@ def _miner_loop_inner(
         except SpaceTradersError as e:
             log(f"[dim]{ship_symbol}: preflight delivery check failed: {e}[/dim]")
 
-    navigate_with_refuel(ship_symbol, ASTEROID)
-    ensure_orbit(ship_symbol)
-    active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
-    _empty_loads = 0  # consecutive full cargo loads with 0 contract good
+    # If the good is available to buy, skip the mining phase entirely
+    _direct_buy = bool(best_buy_waypoint(good))
+    if _direct_buy:
+        log(f"[cyan]{ship_symbol}: {good} is purchasable — skipping to buy directly[/cyan]")
+        navigate_with_refuel(ship_symbol, ASTEROID_BASE)
+        active_survey = None
+        _empty_loads = 3  # trigger buy on first loop iteration
+    else:
+        navigate_with_refuel(ship_symbol, ASTEROID)
+        ensure_orbit(ship_symbol)
+        active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
+        _empty_loads = 0  # consecutive full cargo loads with 0 contract good
 
     while not stop_event.is_set() and not contract_done.is_set():
         # Refresh active_survey from shared pool if we don't have one
@@ -1238,7 +1246,13 @@ def _miner_loop_inner(
             i["units"] for i in _loop_cargo.get("inventory", [])
             if i["symbol"] == good
         )
-        if _loop_space < 5 or (_have_cached > 0 and not _at_asteroid):
+        # Skip mining when good is purchasable and cargo is completely empty
+        _skip_to_buy = (
+            _direct_buy and _empty_loads >= 3
+            and _loop_cargo["units"] == 0
+            and not contract_done.is_set()
+        )
+        if _loop_space < 5 or (_have_cached > 0 and not _at_asteroid) or _skip_to_buy:
             # ── Stationary mode: offload everything to hauler when possible ───
             if _loop_space < 5 and _at_asteroid and _hauler_symbols:
                 _avail_hauler = _get_available_hauler(ASTEROID)
@@ -1415,6 +1429,12 @@ def _miner_loop_inner(
                 f"Cargo: {cargo.get('units')}/{cargo.get('capacity')} | "
                 f"CD: {cd}s"
             )
+            if yld.get("symbol"):
+                db.log_extraction(
+                    ASTEROID, ship_symbol,
+                    active_survey.get("signature") if active_survey else None,
+                    yld["symbol"], yld.get("units", 0),
+                )
             for ev in result.get("events", []):
                 log(f"  [yellow]⚠ {ship_symbol}: {ev.get('name')}: {ev.get('description', '')}[/yellow]")
 
