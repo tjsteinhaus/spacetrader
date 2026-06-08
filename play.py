@@ -45,6 +45,7 @@ _known_markets: list[str] = []                   # grows after discover_markets(
 _good_exporters: dict[str, list[str]] = {}       # {good: [waypoints that sell it]}
 _good_buyers:    dict[str, list[str]] = {}       # {good: [waypoints that import/buy it]}
 _buy_source_blacklist: dict[str, float] = {}     # {waypoint: expiry_timestamp} — temp skip on empty tradeGoods
+_contract_retry_after: dict[str, float] = {}     # {contract_id: earliest_retry_time} — skip unworkable contracts
 
 _fulfill_lock = threading.Lock()                  # prevents double-fulfillment
 _manager_lock = threading.Lock()                  # serialises background fleet-management ops
@@ -1354,6 +1355,11 @@ def _miner_loop_inner(
                         else:
                             log(f"[yellow]{ship_symbol}: {good} not found in {_buy_wp} tradeGoods — blacklisting for 20 min[/yellow]")
                             _buy_source_blacklist[_buy_wp] = time.time() + 1200  # 20-minute cooldown
+                    else:
+                        # No market exports this good at all
+                        if _empty_loads >= 5:
+                            log(f"[red bold]{ship_symbol}: {good} cannot be mined or purchased after {_empty_loads} loads — contract unworkable, exiting[/red bold]")
+                            return
 
                 navigate_with_refuel(ship_symbol, ASTEROID)
                 ensure_orbit(ship_symbol)
@@ -1827,7 +1833,12 @@ def work_contract(contract: dict) -> None:
     )
     mgr_thread.start()
 
-    contract_done.wait()   # block until any miner signals fulfillment
+    while not contract_done.is_set():
+        worker_threads = [t for t in threads if "miner" in t.name or "hauler" in t.name]
+        if worker_threads and all(not t.is_alive() for t in worker_threads):
+            log("[yellow]All worker threads exited without fulfilling contract[/yellow]")
+            break
+        contract_done.wait(timeout=15)
     stop_event.set()       # tell remaining miners and fleet manager to wind down
     for t in threads:
         t.join(timeout=120)
@@ -1950,7 +1961,13 @@ def buy_ships() -> int:
 def get_next_contract() -> dict | None:
     """Return an unfulfilled contract, or negotiate a new one if none exist."""
     cs = contracts_api.get_contracts()
-    pending = [c for c in cs if not c.get("fulfilled") and c.get("type") == "PROCUREMENT"]
+    now = time.time()
+    pending = [
+        c for c in cs
+        if not c.get("fulfilled")
+        and c.get("type") == "PROCUREMENT"
+        and now >= _contract_retry_after.get(c.get("id", ""), 0)
+    ]
     if pending:
         strategy = load_strategy()
         target = strategy.get("target_contract_id")
@@ -2073,6 +2090,15 @@ def run() -> None:
             continue
 
         work_contract(contract)
+
+        # If miners gave up (contract unworkable), add cooldown before retry
+        try:
+            _fresh = contracts_api.get_contract(contract["id"])
+            if not _fresh.get("fulfilled"):
+                _contract_retry_after[contract["id"]] = time.time() + 900  # 15-min cooldown
+                log("[yellow]Contract unfulfilled after workers exited — will retry in 15 min[/yellow]")
+        except SpaceTradersError:
+            pass
 
         # Post-contract: expand → maintain → upgrade
         buy_ships()
