@@ -1246,10 +1246,9 @@ def _miner_loop_inner(
             i["units"] for i in _loop_cargo.get("inventory", [])
             if i["symbol"] == good
         )
-        # Skip mining when good is purchasable and cargo is completely empty
+        # Skip mining when good is purchasable (cargo may have junk; sell_junk handles it)
         _skip_to_buy = (
             _direct_buy and _empty_loads >= 3
-            and _loop_cargo["units"] == 0
             and not contract_done.is_set()
         )
         if _loop_space < 5 or (_have_cached > 0 and not _at_asteroid) or _skip_to_buy:
