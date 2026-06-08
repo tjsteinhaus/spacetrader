@@ -1,5 +1,5 @@
 {
-  "mode": "upgrade_first",
-  "notes": "Upgrade LASER_I → II on ships 3/5/6 before buying more hulls",
+  "mode": "contract_grind",
+  "notes": "Phase 2: Save for SHIP_LIGHT_HAULER at A2 (334,850 cr). Need 365,000 credits total. Currently ~219k. ETA: ~3-5 contracts.",
   "target_contract_id": null
 }

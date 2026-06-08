@@ -24,7 +24,7 @@ import universe as universe_api
 from client import SpaceTradersError
 
 load_dotenv()
-console = Console()
+console = Console(force_terminal=True)
 
 # ── Strategy file (shared with MCP server) ───────────────────────────────────
 STRATEGY_FILE = Path(__file__).parent / "strategy.json"
@@ -44,6 +44,7 @@ _market_cache_ts: dict[str, float] = {}          # {wp: unix_timestamp}
 _known_markets: list[str] = []                   # grows after discover_markets()
 _good_exporters: dict[str, list[str]] = {}       # {good: [waypoints that sell it]}
 _good_buyers:    dict[str, list[str]] = {}       # {good: [waypoints that import/buy it]}
+_buy_source_blacklist: dict[str, float] = {}     # {waypoint: expiry_timestamp} — temp skip on empty tradeGoods
 
 _fulfill_lock = threading.Lock()                  # prevents double-fulfillment
 _manager_lock = threading.Lock()                  # serialises background fleet-management ops
@@ -61,21 +62,24 @@ ASTEROID_BASE  = "X1-HU91-H52"     # Moon at center cluster — MARKETPLACE + SH
 SHIPYARD_WP    = "X1-HU91-H52"     # Primary shipyard (Moon) — used for repairs/upgrades
 SHIPYARD_WPS   = ["X1-HU91-H52", "X1-HU91-A2"]  # All shipyards checked when buying ships
 CREDIT_RESERVE = 30_000            # Minimum credits to keep in reserve
-MIN_BUY_CREDITS = 120_000          # Don't buy ships until we can afford the light shuttle
+MIN_BUY_CREDITS = 365_000          # Don't buy until we can afford the SHIP_LIGHT_HAULER (334,850 + 30k reserve)
 FLEET_MANAGER_SHIP = "TYLERMASTERY-2"  # Idle non-miner ship kept at SHIPYARD_WP for background ops
 MIN_FUEL_CAPACITY  = 200           # Skip ships whose fuel tank can't cover B7↔B8↔H51 routes
 
 # Ship purchase priority for mining contracts (higher score = buy first)
 # -1 means never buy
 SHIP_SCORES = {
+    # Phase 1: upgrade lasers (no buying needed)
+    # Phase 2: buy hauler so miners stay at asteroid full-time
+    # Phase 3: save for COMMAND_FRIGATE (has MODULE_JUMP_DRIVE_I) to reach X1-FM26
     "SHIP_ORE_HOUND":       100,  # Best miner: powerful mounts + large cargo
-    "SHIP_MINING_DRONE":    90,   # Decent miner — only buy if fuel tank >= MIN_FUEL_CAPACITY
-    "SHIP_SURVEYOR":        75,   # No mining laser but fills survey pool — worth buying
-    "SHIP_HEAVY_FREIGHTER": 65,   # Good once fleet is large
-    "SHIP_LIGHT_HAULER":    60,   # Useful once we have 2+ miners
-    "SHIP_LIGHT_SHUTTLE":   55,   # Dedicated delivery runner (A2 shipyard, 86k cr)
-    "SHIP_COMMAND_FRIGATE": 50,   # Versatile but expensive
-    "SHIP_PROBE":           -1,   # Useless for contracts – never buy
+    "SHIP_LIGHT_HAULER":    95,   # Phase 2 target — haul deliveries so miners never leave asteroid
+    "SHIP_HEAVY_FREIGHTER": 90,   # Phase 2 alt — larger cargo if available
+    "SHIP_COMMAND_FRIGATE": 85,   # Phase 3 target — has MODULE_JUMP_DRIVE_I built in for X1-FM26
+    "SHIP_SURVEYOR":        -1,   # Already have TM-4 surveyor — don't buy more
+    "SHIP_MINING_DRONE":    -1,   # 4 miners is enough — skip until hauler acquired
+    "SHIP_LIGHT_SHUTTLE":   35,   # Less useful than hauler for our setup
+    "SHIP_PROBE":           -1,   # Never buy
 }
 
 MIN_SELL_PRICE     = 30     # cr/unit — jettison anything below this instead of hauling to market
@@ -168,18 +172,19 @@ def ensure_docked(ship_symbol: str) -> None:
 
 def navigate_to(ship_symbol: str, destination: str) -> None:
     ship = fleet_api.get_ship(ship_symbol)
-    if ship["nav"]["waypointSymbol"] == destination:
-        if ship["nav"]["status"] == "IN_TRANSIT":
-            # Already en route (e.g., drifting from a previous rescue) — wait for arrival
-            log(f"[dim]{ship_symbol}: already en route to {destination}, waiting...[/dim]")
+    # If already in transit toward the destination (e.g., drifting there), just wait
+    if ship["nav"]["status"] == "IN_TRANSIT":
+        route_dest = ship["nav"].get("route", {}).get("destination", {}).get("symbol", "")
+        if route_dest == destination:
+            log(f"[dim]{ship_symbol}: already en route to {destination} — waiting...[/dim]")
             wait_for_ship(ship_symbol)
-            # Restore CRUISE mode in case ship was left in DRIFT
             _fm = fleet_api.get_ship(ship_symbol)["nav"].get("flightMode", "CRUISE")
             if _fm != "CRUISE":
                 fleet_api.patch_nav(ship_symbol, "CRUISE")
-                log(f"[dim]{ship_symbol}: restored CRUISE mode after drift arrival[/dim]")
-        else:
-            log(f"[dim]{ship_symbol} already at {destination}[/dim]")
+                log(f"[dim]{ship_symbol}: restored CRUISE mode after in-transit wait[/dim]")
+            return
+    if ship["nav"]["waypointSymbol"] == destination:
+        log(f"[dim]{ship_symbol} already at {destination}[/dim]")
         return
 
     # ── Inter-system travel ───────────────────────────────────────────────────
@@ -228,10 +233,26 @@ def navigate_to(ship_symbol: str, destination: str) -> None:
             wait_for_ship(ship_symbol)
             navigate_to(ship_symbol, destination)
             return
-        if e.code == 4203:  # insufficient fuel — emergency DRIFT to destination
-            log(f"[red]⚠ {ship_symbol}: insufficient fuel, emergency DRIFT to {destination}[/red]")
+        if e.code == 4203:  # insufficient fuel — try local refuel first, then DRIFT
+            log(f"[yellow]⚠ {ship_symbol}: insufficient fuel for {destination} — attempting local refuel[/yellow]")
+            try:
+                ensure_docked(ship_symbol)
+                refuel_if_needed(ship_symbol, threshold=100_000)
+                fleet_api.orbit(ship_symbol)
+                fleet_api.navigate(ship_symbol, destination)
+                wait_for_ship(ship_symbol)
+                return
+            except SpaceTradersError:
+                pass
+            log(f"[red]⚠ {ship_symbol}: no fuel available locally, emergency DRIFT to {destination}[/red]")
             fleet_api.patch_nav(ship_symbol, "DRIFT")
-            fleet_api.navigate(ship_symbol, destination)
+            try:
+                fleet_api.navigate(ship_symbol, destination)
+            except SpaceTradersError as drift_e:
+                if drift_e.code == 4214:
+                    log(f"[dim]{ship_symbol}: already drifting to {destination}[/dim]")
+                else:
+                    raise
             wait_for_ship(ship_symbol)
             fleet_api.patch_nav(ship_symbol, "CRUISE")
             log(f"[dim]{ship_symbol}: restored CRUISE flight mode[/dim]")
@@ -263,13 +284,16 @@ def navigate_with_refuel(ship_symbol: str, destination: str) -> None:
         dx, dy = _get_coords(destination)
         dist_to_dest = ((dx - cx) ** 2 + (dy - cy) ** 2) ** 0.5
 
-        if cur_fuel >= dist_to_dest:
+        if cur_fuel > dist_to_dest:
             navigate_to(ship_symbol, destination)
             return
 
         # Find the best reachable market: within fuel_cap of current position
         # and closer to the destination than we currently are.
-        markets = _known_markets or [ASTEROID_BASE]
+        # Only consider markets that actually sell FUEL — routing through a
+        # fuel-less market (e.g. J58) strands ships and forces a long drift.
+        fuel_markets = _good_exporters.get("FUEL", [])
+        markets = fuel_markets if fuel_markets else (_known_markets or [ASTEROID_BASE])
         best_wp: str | None = None
         best_remaining = dist_to_dest  # must beat our current distance
 
@@ -278,9 +302,11 @@ def navigate_with_refuel(ship_symbol: str, destination: str) -> None:
                 continue
             wx, wy = _get_coords(wp)
             hop_dist = ((wx - cx) ** 2 + (wy - cy) ** 2) ** 0.5
-            if hop_dist > fuel_cap:
-                continue  # unreachable even at full tank
+            if hop_dist > cur_fuel:
+                continue  # can't reach this hop with current fuel
             remaining = ((dx - wx) ** 2 + (dy - wy) ** 2) ** 0.5
+            if remaining > fuel_cap:
+                continue  # even at full tank from this hop, destination is out of range — dead end
             if remaining < best_remaining:
                 best_remaining = remaining
                 best_wp = wp
@@ -352,7 +378,7 @@ def sell_junk(ship_symbol: str, keep_good: str | None = None) -> None:
     target_wp = best_sell_market_for_cargo(worth_selling)
     current_wp = ship["nav"]["waypointSymbol"]
     if current_wp != target_wp or ship["nav"]["status"] != "DOCKED":
-        navigate_to(ship_symbol, target_wp)
+        navigate_with_refuel(ship_symbol, target_wp)
         ensure_docked(ship_symbol)
 
     # Re-fetch cargo after possible travel
@@ -371,12 +397,14 @@ def sell_junk(ship_symbol: str, keep_good: str | None = None) -> None:
                 log(f"[dim]Jettisoned {item['units']}x {item['symbol']}[/dim]")
             except SpaceTradersError:
                 pass
+    # Refuel at the sell market before returning — no-op if market has no fuel
+    refuel_if_needed(ship_symbol, threshold=100_000)
 
 
 def refuel_if_needed(ship_symbol: str, threshold: int = 200) -> None:
     ship = fleet_api.get_ship(ship_symbol)
     fuel = ship["fuel"]
-    if fuel["capacity"] > 0 and fuel["current"] < threshold:
+    if fuel["capacity"] > 0 and fuel["current"] < min(threshold, fuel["capacity"]):
         try:
             result = fleet_api.refuel(ship_symbol)
             f = result.get("fuel", {})
@@ -419,17 +447,18 @@ def _find_jump_gate(system: str) -> str | None:
 
 
 def nearest_refuel_point(from_wp: str) -> str:
-    """Return the closest known market waypoint to from_wp using coordinate distance."""
-    markets = _known_markets or [ASTEROID_BASE]
+    """Return the closest fuel-selling market waypoint to from_wp."""
+    fuel_markets = _good_exporters.get("FUEL", [])
+    candidates = fuel_markets if fuel_markets else (_known_markets or [ASTEROID_BASE])
     fx, fy = _get_coords(from_wp)
     best_wp, best_dist = ASTEROID_BASE, float("inf")
-    for wp in markets:
+    for wp in candidates:
         wx, wy = _get_coords(wp)
         dist = ((wx - fx) ** 2 + (wy - fy) ** 2) ** 0.5
         if dist < best_dist:
             best_dist, best_wp = dist, wp
     if best_wp != ASTEROID_BASE:
-        log(f"[dim]Nearest market to {from_wp}: {best_wp} (dist={best_dist:.0f})[/dim]")
+        log(f"[dim]Nearest fuel market to {from_wp}: {best_wp} (dist={best_dist:.0f})[/dim]")
     return best_wp
 
 
@@ -475,6 +504,15 @@ def scan_good_sources() -> None:
                 sym = g.get("symbol", "")
                 if sym:
                     _good_buyers.setdefault(sym, []).append(wp)
+            # Exchange markets buy AND sell — include them as buyers too
+            for g in data.get("exchange", []):
+                sym = g.get("symbol", "")
+                if sym:
+                    _good_buyers.setdefault(sym, []).append(wp)
+            # Seed the market-price timestamp so the first sell_junk doesn't re-fetch all 29
+            # markets immediately after startup. Prices (tradeGoods) require a ship on site.
+            if wp not in _market_cache_ts:
+                _market_cache_ts[wp] = time.time()
         except SpaceTradersError:
             pass
         time.sleep(0.4)  # throttle to avoid 429 bursts
@@ -485,8 +523,9 @@ def scan_good_sources() -> None:
 def get_market_prices(waypoint: str) -> dict[str, int]:
     """Return {trade_symbol: sell_price} for a waypoint. Results are cached."""
     now = time.time()
-    if waypoint in _market_cache and now - _market_cache_ts.get(waypoint, 0) < MARKET_CACHE_TTL:
-        return _market_cache[waypoint]
+    if _market_cache_ts.get(waypoint, 0) + MARKET_CACHE_TTL > now:
+        # Return cached data (may be {} if visited without a ship — still a valid cache hit)
+        return _market_cache.get(waypoint, {})
     try:
         data = universe_api.get_market(SYSTEM, waypoint)
         prices = {g["symbol"]: g["sellPrice"] for g in data.get("tradeGoods", [])}
@@ -514,30 +553,48 @@ def best_sell_waypoint(good: str) -> tuple[str, int]:
 
 def best_buy_waypoint(good: str) -> str:
     """Return the waypoint that exports/exchanges `good` (i.e. sells it to us).
-    Prefers markets with a known price; falls back to any exporter in _good_exporters."""
+    Prefers markets with a known price; falls back to any exporter in _good_exporters.
+    Skips waypoints in _buy_source_blacklist until their cooldown expires."""
+    now = time.time()
+    available = [wp for wp in _good_exporters.get(good, [])
+                 if _buy_source_blacklist.get(wp, 0) <= now]
     # First pass: prefer markets with a live price already in cache
     best_wp, best_price = "", 0
-    for wp in _good_exporters.get(good, []):
+    for wp in available:
         price = _market_cache.get(wp, {}).get(f"_buy_{good}", 0)
         if price > 0 and (best_price == 0 or price < best_price):
             best_price, best_wp = price, wp
     if best_wp:
         return best_wp
-    # Fallback: return any known exporter (price unknown, will be revealed on arrival)
-    exporters = _good_exporters.get(good, [])
-    return exporters[0] if exporters else ""
+    # Fallback: return any non-blacklisted exporter (price unknown, will be revealed on arrival)
+    return available[0] if available else ""
 
 
 def best_sell_market_for_cargo(inventory: list[dict]) -> str:
     """
     Given a list of cargo items, return the waypoint with the highest aggregate
-    sell revenue. Falls back to ASTEROID_BASE if no price data is available.
+    sell revenue. Prefers the base cluster (markets co-located with ASTEROID_BASE,
+    e.g. H51/H52/H53) so we don't waste travel time for marginal gains.
+
+    Only routes to a remote market if it offers both a >20% relative premium AND
+    at least 500 cr absolute gain over the best cluster market.
     """
+    # Narrow candidates to markets that are plausible buyers for our goods.
+    # Using all 29 markets is wasteful when only 2-3 actually buy ores.
+    our_syms = {item["symbol"] for item in inventory}
+    candidate_markets: set[str] = {ASTEROID_BASE}
+    for sym in our_syms:
+        candidate_markets.update(_good_buyers.get(sym, []))
+    # Also include any market where we already have live price data for our goods
+    for wp, prices in _market_cache.items():
+        if any(sym in prices for sym in our_syms):
+            candidate_markets.add(wp)
+
     market_values: dict[str, int] = {}
     for item in inventory:
-        for wp in (_known_markets or [ASTEROID_BASE]):
+        for wp in candidate_markets:
             price = get_market_prices(wp).get(item["symbol"], 0)
-            # If no cached price, treat known importers as viable (will get real price on arrival)
+            # If no cached price, treat known importers as viable (real price on arrival)
             if price == 0 and wp in _good_buyers.get(item["symbol"], []):
                 price = MIN_SELL_PRICE
             market_values[wp] = market_values.get(wp, 0) + price * item["units"]
@@ -545,17 +602,37 @@ def best_sell_market_for_cargo(inventory: list[dict]) -> str:
     if not market_values:
         return ASTEROID_BASE
 
-    base_val = market_values.get(ASTEROID_BASE, 0)
-    best_market, best_val = ASTEROID_BASE, base_val
+    # Identify the "base cluster": markets co-located with ASTEROID_BASE (≤5 units away).
+    # These are free to visit since we refuel there anyway (e.g. H51 and H53 at H52's coords).
+    bx, by = _get_coords(ASTEROID_BASE)
+    cluster_val = 0
+    cluster_best = ASTEROID_BASE
+    for wp, val in market_values.items():
+        wx, wy = _get_coords(wp)
+        if ((wx - bx) ** 2 + (wy - by) ** 2) ** 0.5 < 5:
+            if val > cluster_val:
+                cluster_val, cluster_best = val, wp
+
+    # Find globally best market across all candidates
+    best_market, best_val = cluster_best, cluster_val
     for wp, val in market_values.items():
         if val > best_val:
             best_val, best_market = val, wp
 
-    # Only reroute if another market pays meaningfully more (>20% premium)
-    if best_market != ASTEROID_BASE and best_val > base_val * 1.20:
-        log(f"[dim]Routing to {best_market} (est. {best_val:,} cr vs {base_val:,} cr at base)[/dim]")
-        return best_market
-    return ASTEROID_BASE
+    # Only reroute to a remote market if it beats the cluster by both >20% relative
+    # AND ≥500 cr absolute — prevents burning 4+ min travel for marginal gains.
+    # Also require the remote market sells FUEL so we can refuel before heading back.
+    if best_market != cluster_best:
+        abs_gain = best_val - cluster_val
+        if best_val > cluster_val * 1.20 and abs_gain >= 500:
+            fuel_markets = set(_good_exporters.get("FUEL", []))
+            if best_market in fuel_markets:
+                log(f"[dim]Routing to {best_market} (est. {best_val:,} cr vs {cluster_val:,} cr at cluster)[/dim]")
+                return best_market
+            else:
+                log(f"[dim]Skipping {best_market} — no fuel sold there, selling at cluster instead[/dim]")
+
+    return cluster_best
 
 
 def show_market_table(waypoint: str) -> None:
@@ -634,9 +711,17 @@ def _best_mount_tier(ship: dict) -> int:
 def upgrade_mining_mounts(ship_symbol: str) -> None:
     """
     Attempt to install the next-tier mining laser on a mining ship.
-    Ship must be docked at a shipyard; credits are deducted automatically.
+    1. Find a market that sells the target mount item.
+    2. Navigate the ship there and purchase 1 unit into cargo.
+    3. Navigate to SHIPYARD_WP and install the mount.
     """
     ship = fleet_api.get_ship(ship_symbol)
+    if not has_mining_mount(ship):
+        return
+    # Skip if the ship is mid-flight; don't block the main loop waiting for a long transit
+    if ship.get("nav", {}).get("status") == "IN_TRANSIT":
+        log(f"[dim]{ship_symbol}: in transit — deferring upgrade to next loop[/dim]")
+        return
     if not has_mining_mount(ship):
         return
     tier = _best_mount_tier(ship)
@@ -646,6 +731,24 @@ def upgrade_mining_mounts(ship_symbol: str) -> None:
     target = MINING_MOUNT_TIERS[tier + 1]
     current = MINING_MOUNT_TIERS[tier] if tier >= 0 else "none"
     log(f"[bold]Upgrading {ship_symbol}: {current} → {target}[/bold]")
+
+    # 1. Find a market selling the mount item
+    buy_wp = best_buy_waypoint(target)
+    if not buy_wp:
+        log(f"[yellow]{ship_symbol}: no market found selling {target} — skipping upgrade[/yellow]")
+        return
+
+    # 2. Navigate ship to the market and purchase 1 mount
+    navigate_to(ship_symbol, buy_wp)
+    ensure_docked(ship_symbol)
+    try:
+        fleet_api.purchase_cargo(ship_symbol, target, 1)
+        log(f"[dim]{ship_symbol}: purchased {target} for upgrade[/dim]")
+    except SpaceTradersError as e:
+        log(f"[dim]{ship_symbol}: could not purchase {target}: {e} — skipping upgrade[/dim]")
+        return
+
+    # 3. Navigate to shipyard and install
     navigate_to(ship_symbol, SHIPYARD_WP)
     ensure_docked(ship_symbol)
     try:
@@ -757,6 +860,20 @@ def surveyor_loop(
     Dedicated surveyor thread. Navigates to B8, then continuously surveys the
     asteroid and publishes results to the shared pool for miners to consume.
     """
+    try:
+        _surveyor_loop_inner(ship_symbol, contract, contract_done, stop_event)
+    except Exception as e:
+        import traceback
+        log(f"[red]💥 {ship_symbol} surveyor thread crashed: {e}[/red]")
+        log(f"[dim]{traceback.format_exc()}[/dim]")
+
+
+def _surveyor_loop_inner(
+    ship_symbol: str,
+    contract: dict,
+    contract_done: threading.Event,
+    stop_event: threading.Event,
+) -> None:
     good = contract["terms"]["deliver"][0]["tradeSymbol"]
     log(f"[magenta]🔭 {ship_symbol} surveyor thread started[/magenta]")
 
@@ -826,6 +943,20 @@ def miner_loop(
     Per-ship mining thread. Mines at ASTEROID, delivers contract good,
     sells junk at best market. Exits when contract_done or stop_event is set.
     """
+    try:
+        _miner_loop_inner(ship_symbol, contract, contract_done, stop_event)
+    except Exception as e:
+        import traceback
+        log(f"[red]💥 {ship_symbol} miner thread crashed: {e}[/red]")
+        log(f"[dim]{traceback.format_exc()}[/dim]")
+
+
+def _miner_loop_inner(
+    ship_symbol: str,
+    contract: dict,
+    contract_done: threading.Event,
+    stop_event: threading.Event,
+) -> None:
     cid = contract["id"]
     d = contract["terms"]["deliver"][0]  # first delivery term
     good = d["tradeSymbol"]
@@ -843,6 +974,44 @@ def miner_loop(
         navigate_with_refuel(ship_symbol, ASTEROID_BASE)
         ensure_docked(ship_symbol)
         refuel_if_needed(ship_symbol, threshold=100_000)  # fill to max
+
+    # Preflight delivery shortcut: if we already have enough contract goods, deliver now
+    _s0_cargo = _s0["cargo"]
+    _have_preflight = sum(i["units"] for i in _s0_cargo.get("inventory", []) if i["symbol"] == good)
+    if _have_preflight > 0 and not contract_done.is_set():
+        try:
+            _fc_pre = contracts_api.get_contract(cid)
+            for _dt_pre in _fc_pre.get("terms", {}).get("deliver", []):
+                if _dt_pre["tradeSymbol"] == good:
+                    _remaining_pre = _dt_pre["unitsRequired"] - _dt_pre["unitsFulfilled"]
+                    if _have_preflight >= _remaining_pre > 0:
+                        log(f"[cyan]{ship_symbol}: preflight shortcut — has {_have_preflight}x {good}, need {_remaining_pre} — delivering now[/cyan]")
+                        navigate_with_refuel(ship_symbol, ASTEROID_BASE)
+                        if contract_done.is_set():
+                            return  # contract was fulfilled while we navigated; bail out cleanly
+                        ensure_docked(ship_symbol)
+                        refuel_if_needed(ship_symbol, threshold=100_000)
+                        navigate_with_refuel(ship_symbol, delivery_wp)
+                        ensure_docked(ship_symbol)
+                        _deliver_amt = min(_have_preflight, _remaining_pre)
+                        result = contracts_api.deliver_contract(cid, ship_symbol, good, _deliver_amt)
+                        c = result.get("contract", {})
+                        for dt in c.get("terms", {}).get("deliver", []):
+                            if dt["tradeSymbol"] == good:
+                                f = dt["unitsFulfilled"]
+                                req = dt["unitsRequired"]
+                                log(f"[green]✓ {ship_symbol}: {f}/{req} {good} delivered (preflight)[/green]")
+                                if f >= req:
+                                    with _fulfill_lock:
+                                        if not contract_done.is_set():
+                                            res = contracts_api.fulfill_contract(cid)
+                                            ag = res.get("agent", {})
+                                            log(f"[green bold]🏆 Contract fulfilled! Credits: {ag.get('credits', 0):,}[/green bold]")
+                                            contract_done.set()
+                                    return
+                    break
+        except SpaceTradersError as e:
+            log(f"[dim]{ship_symbol}: preflight delivery check failed: {e}[/dim]")
 
     navigate_with_refuel(ship_symbol, ASTEROID)
     ensure_orbit(ship_symbol)
@@ -878,17 +1047,36 @@ def miner_loop(
             ensure_orbit(ship_symbol)
             active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
 
-        # ── Cargo almost full: deliver or dump ────────────────────────────────
-        if cargo_space(ship_symbol) < 5:
-            have = good_in_cargo(ship_symbol, good)
+        # ── Cargo almost full OR have contract good while not at asteroid ─────
+        _loop_cargo = _loop_ship["cargo"]
+        _loop_space = _loop_cargo["capacity"] - _loop_cargo["units"]
+        _have_cached = sum(
+            i["units"] for i in _loop_cargo.get("inventory", [])
+            if i["symbol"] == good
+        )
+        if _loop_space < 5 or (_have_cached > 0 and not _at_asteroid):
+            have = _have_cached
 
             if have > 0 and not contract_done.is_set():
                 _empty_loads = 0
+                # Cap delivery to remaining needed — API rejects over-delivery with 4508
+                try:
+                    _fc = contracts_api.get_contract(cid)
+                    for _dt in _fc.get("terms", {}).get("deliver", []):
+                        if _dt["tradeSymbol"] == good:
+                            _remaining = _dt["unitsRequired"] - _dt["unitsFulfilled"]
+                            if _remaining <= 0:
+                                contract_done.set()
+                                return
+                            have = min(have, _remaining)
+                            break
+                except SpaceTradersError:
+                    pass  # use original have if fetch fails
                 # Refuel at ASTEROID_BASE before the long delivery trip to maximize fuel
-                navigate_to(ship_symbol, ASTEROID_BASE)
+                navigate_with_refuel(ship_symbol, ASTEROID_BASE)
                 ensure_docked(ship_symbol)
                 refuel_if_needed(ship_symbol, threshold=100_000)
-                navigate_to(ship_symbol, delivery_wp)
+                navigate_with_refuel(ship_symbol, delivery_wp)
                 ensure_docked(ship_symbol)
                 try:
                     result = contracts_api.deliver_contract(cid, ship_symbol, good, have)
@@ -912,22 +1100,26 @@ def miner_loop(
                     log(f"[yellow]{ship_symbol} delivery error: {e}[/yellow]")
 
                 if not contract_done.is_set():
-                    # Drift to nearest market (may be closer than ASTEROID_BASE)
+                    # Multi-hop back to asteroid (delivery WP may be far from ASTEROID_BASE)
                     _nearest = nearest_refuel_point(delivery_wp)
-                    navigate_to(ship_symbol, _nearest)
+                    navigate_with_refuel(ship_symbol, _nearest)
                     ensure_docked(ship_symbol)
                     refuel_if_needed(ship_symbol, threshold=100_000)  # fill to max
-                    navigate_to(ship_symbol, ASTEROID)
+                    navigate_with_refuel(ship_symbol, ASTEROID)
                     ensure_orbit(ship_symbol)
             else:
                 # No contract good in cargo — junk run, then optionally buy the good
                 _empty_loads += 1
-                navigate_to(ship_symbol, ASTEROID_BASE)
+                navigate_with_refuel(ship_symbol, ASTEROID_BASE)
                 ensure_docked(ship_symbol)
                 refuel_if_needed(ship_symbol, threshold=100_000)  # always fill to max
                 sell_junk(ship_symbol, good)
+                # If sell_junk routed to a remote market, refuel at base before returning to asteroid
+                navigate_with_refuel(ship_symbol, ASTEROID_BASE)
+                ensure_docked(ship_symbol)
+                refuel_if_needed(ship_symbol, threshold=100_000)
 
-                if _empty_loads >= 2 and not contract_done.is_set():
+                if _empty_loads >= 1 and not contract_done.is_set():
                     _buy_wp = best_buy_waypoint(good)
                     if _buy_wp:
                         log(f"[cyan]{ship_symbol}: {_empty_loads} empty loads — switching to buy {good} from {_buy_wp}[/cyan]")
@@ -942,6 +1134,16 @@ def miner_loop(
                             _free = _ship_now["cargo"]["capacity"] - _ship_now["cargo"]["units"]
                             _affordable = max(0, (_me["credits"] - CREDIT_RESERVE) // _buy_price)
                             _to_buy = min(_free, _affordable)
+                            # Cap at remaining contract need — avoid buying excess
+                            try:
+                                _fc2 = contracts_api.get_contract(cid)
+                                for _dt2 in _fc2.get("terms", {}).get("deliver", []):
+                                    if _dt2["tradeSymbol"] == good:
+                                        _still_need = _dt2["unitsRequired"] - _dt2["unitsFulfilled"]
+                                        _to_buy = min(_to_buy, max(0, _still_need))
+                                        break
+                            except SpaceTradersError:
+                                pass
                             if _to_buy > 0:
                                 try:
                                     result = fleet_api.purchase_cargo(ship_symbol, good, _to_buy)
@@ -956,9 +1158,10 @@ def miner_loop(
                                 _affordable_str = f"{_affordable}u affordable" if _buy_price > 0 else "price unknown"
                                 log(f"[yellow]{ship_symbol}: can't buy {good} — {_affordable_str} (credits: {_me['credits']:,}, reserve: {CREDIT_RESERVE:,})[/yellow]")
                         else:
-                            log(f"[yellow]{ship_symbol}: {good} not found in {_buy_wp} tradeGoods (no ship visit yet?)[/yellow]")
+                            log(f"[yellow]{ship_symbol}: {good} not found in {_buy_wp} tradeGoods — blacklisting for 20 min[/yellow]")
+                            _buy_source_blacklist[_buy_wp] = time.time() + 1200  # 20-minute cooldown
 
-                navigate_to(ship_symbol, ASTEROID)
+                navigate_with_refuel(ship_symbol, ASTEROID)
                 ensure_orbit(ship_symbol)
             continue
 
@@ -1362,7 +1565,7 @@ def buy_ships() -> int:
 def get_next_contract() -> dict | None:
     """Return an unfulfilled contract, or negotiate a new one if none exist."""
     cs = contracts_api.get_contracts()
-    pending = [c for c in cs if not c.get("fulfilled")]
+    pending = [c for c in cs if not c.get("fulfilled") and c.get("type") == "PROCUREMENT"]
     if pending:
         strategy = load_strategy()
         target = strategy.get("target_contract_id")
