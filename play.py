@@ -22,6 +22,7 @@ import fleet as fleet_api
 import contracts as contracts_api
 import universe as universe_api
 from client import SpaceTradersError
+import db
 
 load_dotenv()
 console = Console(force_terminal=True)
@@ -385,6 +386,7 @@ def sell_junk(ship_symbol: str, keep_good: str | None = None) -> None:
 
     # Re-fetch cargo after possible travel
     ship = fleet_api.get_ship(ship_symbol)
+    _sell_wp = ship["nav"]["waypointSymbol"]
     for item in ship["cargo"].get("inventory", []):
         if keep_good and item["symbol"] == keep_good:
             continue
@@ -393,6 +395,8 @@ def sell_junk(ship_symbol: str, keep_good: str | None = None) -> None:
             tx = result.get("transaction", {})
             ppu = tx.get("pricePerUnit", 0)
             log(f"[green]💰 Sold {tx.get('units')}x {tx.get('tradeSymbol')} @ {ppu:,}/u = {tx.get('totalPrice', 0):,} cr[/green]")
+            db.log_transaction(_sell_wp, ship_symbol, item["symbol"], "SELL",
+                               tx.get("units", 0), ppu, tx.get("totalPrice", 0))
         except SpaceTradersError:
             try:
                 fleet_api.jettison(ship_symbol, item["symbol"], item["units"])
@@ -479,6 +483,7 @@ def discover_markets() -> list[str]:
         if found:
             _known_markets = found
             log(f"[dim]Found {len(found)} market(s): {', '.join(found)}[/dim]")
+            db.upsert_waypoints(waypoints)
         elif not _known_markets:
             _known_markets = [ASTEROID_BASE]
     except SpaceTradersError as e:
@@ -497,6 +502,7 @@ def scan_good_sources() -> None:
     for wp in (_known_markets or [ASTEROID_BASE]):
         try:
             data = universe_api.get_market(SYSTEM, wp)
+            db.upsert_market_listings(wp, data)
             for category in ("exports", "exchange"):
                 for g in data.get(category, []):
                     sym = g.get("symbol", "")
@@ -537,6 +543,7 @@ def get_market_prices(waypoint: str) -> dict[str, int]:
         # Preserving last-known prices avoids zeroing out H51/H53 when called without a ship.
         if prices or buy:
             _market_cache[waypoint] = {**prices, **buy}
+            db.upsert_market_prices(waypoint, data.get("tradeGoods", []))
         _market_cache_ts[waypoint] = now
         return _market_cache.get(waypoint, {})
     except SpaceTradersError:
@@ -940,6 +947,8 @@ def _surveyor_loop_inner(
             result  = fleet_api.survey(ship_symbol)
             surveys = result.get("surveys", [])
             if surveys:
+                for _sv in surveys:
+                    db.upsert_survey(_sv)
                 _add_shared_surveys(surveys)
                 focused = [s for s in surveys if any(d["symbol"] == good for d in s.get("deposits", []))]
                 total   = sum(sum(1 for d in s["deposits"] if d["symbol"] == good) for s in focused)
@@ -1253,7 +1262,8 @@ def _miner_loop_inner(
             have = _have_cached
 
             if have > 0 and not contract_done.is_set():
-                _empty_loads = 0
+                if _empty_loads < 3:
+                    _empty_loads = 0  # reset only when good was mined, not bought
                 # Cap delivery to remaining needed — API rejects over-delivery with 4508
                 try:
                     _fc = contracts_api.get_contract(cid)
@@ -1345,7 +1355,9 @@ def _miner_loop_inner(
                                     ag = result.get("agent", {})
                                     tx = result.get("transaction", {})
                                     log(f"[green]🛒 {ship_symbol}: bought {_to_buy}x {good} @ {_buy_price:,} cr/u | total {tx.get('totalPrice',0):,} cr | Credits: {ag.get('credits',0):,}[/green]")
-                                    _empty_loads = 0
+                                    db.log_transaction(_buy_wp, ship_symbol, good, "PURCHASE",
+                                                       _to_buy, _buy_price, tx.get("totalPrice", 0))
+                                    _empty_loads = 3  # stay in buy-mode; next junk load re-triggers buy
                                     continue  # cargo now has the good — deliver path fires next iteration
                                 except SpaceTradersError as e:
                                     log(f"[yellow]{ship_symbol}: purchase failed: {e}[/yellow]")
@@ -1961,6 +1973,8 @@ def buy_ships() -> int:
 def get_next_contract() -> dict | None:
     """Return an unfulfilled contract, or negotiate a new one if none exist."""
     cs = contracts_api.get_contracts()
+    for _c in cs:
+        db.upsert_contract(_c)
     now = time.time()
     pending = [
         c for c in cs
@@ -2062,6 +2076,22 @@ def run() -> None:
         "Goal: Complete contracts → buy ships → upgrade → repeat indefinitely",
         border_style="cyan",
     ))
+
+    # Init DB and warm-start caches from previous run
+    db.init_db()
+    _km, _ge, _gb, _mc, _mts = db.load_market_caches(SYSTEM, MARKET_CACHE_TTL)
+    if _km:
+        _known_markets[:] = _km
+        _good_exporters.update(_ge)
+        _good_buyers.update(_gb)
+        _market_cache.update(_mc)
+        _market_cache_ts.update(_mts)
+        log(f"[dim]Warm-loaded {len(_km)} markets, {len(_ge)} goods from DB[/dim]")
+    with _surveys_lock:
+        _loaded_surveys = db.load_active_surveys()
+        if _loaded_surveys:
+            _shared_surveys.extend(_loaded_surveys)
+            log(f"[dim]Warm-loaded {len(_loaded_surveys)} active survey(s) from DB[/dim]")
 
     # Discover all markets in the system on startup
     discover_markets()
