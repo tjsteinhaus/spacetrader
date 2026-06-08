@@ -474,9 +474,13 @@ def nearest_refuel_point(from_wp: str) -> str:
 def auto_configure() -> None:
     """Detect SYSTEM, COMMAND_SHIP, ASTEROID, ASTEROID_BASE, SHIPYARD_WP from the API.
 
-    Scores asteroids by trait quality (avoids STRIPPED), then picks the one
-    with the best traits that also has a nearby ASTEROID_BASE or marketplace
-    with fuel.  Falls back to current defaults on any error.
+    On first run for a given agent callsign: scores all asteroids (avoids STRIPPED,
+    prefers DEEP_CRATERS / precious/rare metal deposits near an ASTEROID_BASE market)
+    and persists the result to the DB.
+
+    On subsequent restarts with the same callsign: loads saved values from DB instantly
+    (no extra API calls).  Delete the agent_config rows or use a new callsign to force
+    re-detection.
     """
     global SYSTEM, COMMAND_SHIP, FLEET_MANAGER_SHIP
     global ASTEROID, ASTEROID_BASE, SHIPYARD_WP, SHIPYARD_WPS, _FACTION_HQ_WP
@@ -494,6 +498,20 @@ def auto_configure() -> None:
         log(f"[yellow]auto_configure: agent query failed ({e}) — keeping defaults[/yellow]")
         return
 
+    # ── Load from DB if this callsign was already configured ──────────────────
+    db.init_db()   # ensure schema exists before reading config
+    saved = db.load_agent_config(callsign)
+    if saved.get("ASTEROID"):
+        ASTEROID       = saved["ASTEROID"]
+        ASTEROID_BASE  = saved.get("ASTEROID_BASE", ASTEROID_BASE)
+        SHIPYARD_WP    = saved.get("SHIPYARD_WP",   SHIPYARD_WP)
+        SHIPYARD_WPS   = saved.get("SHIPYARD_WPS",  ",".join(SHIPYARD_WPS)).split(",")
+        _FACTION_HQ_WP = saved.get("FACTION_HQ_WP", hq)
+        log(f"[cyan]Loaded config from DB: ASTEROID={ASTEROID} | BASE={ASTEROID_BASE}[/cyan]")
+        log(f"[cyan]Shipyards: {SHIPYARD_WPS} | HQ: {_FACTION_HQ_WP}[/cyan]")
+        return
+
+    # ── First run for this callsign — detect and score ────────────────────────
     try:
         waypoints = universe_api.get_waypoints(SYSTEM)
     except SpaceTradersError as e:
@@ -520,7 +538,6 @@ def auto_configure() -> None:
     shipyards:   list[str]                  = []
     base_wps:    list[str]                  = []   # ASTEROID_BASE type — purpose-built support
     market_wps:  list[str]                  = []   # any marketplace (fallback base)
-    faction_hq:  str                        = hq
 
     for wp in waypoints:
         sym          = wp["symbol"]
@@ -550,7 +567,6 @@ def auto_configure() -> None:
         if score <= -9000:          # STRIPPED — hard skip
             continue
 
-        # Find nearest base candidate and add a proximity bonus
         ax, ay               = coords[sym]
         nearest_base, n_dist = None, float("inf")
         for bc in base_candidates:
@@ -583,8 +599,18 @@ def auto_configure() -> None:
         SHIPYARD_WPS = shipyards
         log(f"[cyan]Shipyards: {SHIPYARD_WPS}[/cyan]")
 
-    _FACTION_HQ_WP = faction_hq
+    _FACTION_HQ_WP = hq
     log(f"[cyan]Faction HQ waypoint: {_FACTION_HQ_WP}[/cyan]")
+
+    # ── Persist so future restarts skip re-detection ──────────────────────────
+    db.save_agent_config(callsign, {
+        "ASTEROID":       ASTEROID,
+        "ASTEROID_BASE":  ASTEROID_BASE,
+        "SHIPYARD_WP":    SHIPYARD_WP,
+        "SHIPYARD_WPS":   ",".join(SHIPYARD_WPS),
+        "FACTION_HQ_WP":  _FACTION_HQ_WP,
+    })
+    log(f"[dim]Config saved to DB for {callsign}[/dim]")
 
 
 # ── Market intelligence ───────────────────────────────────────────────────────
@@ -2215,11 +2241,10 @@ def run() -> None:
         border_style="cyan",
     ))
 
-    # Auto-configure system/ship/asteroid constants from the live API first
+    # Auto-configure system/ship/asteroid constants (also calls db.init_db() internally)
     auto_configure()
 
-    # Init DB and warm-start caches from previous run
-    db.init_db()
+    # Warm-start caches from previous run
     _km, _ge, _gb, _mc, _mts = db.load_market_caches(SYSTEM, MARKET_CACHE_TTL)
     if _km:
         _known_markets[:] = _km
