@@ -61,16 +61,17 @@ _hauler_symbols:   list[str] = []   # symbols of ships running hauler_loop
 _explorer_symbols: list[str] = []   # symbols of ships running explorer_loop
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SYSTEM         = "X1-GK27"
-COMMAND_SHIP   = "MASTERY-1"
-ASTEROID       = "X1-GK27-CD5A"    # Engineered asteroid, center cluster — COMMON_METAL_DEPOSITS + MARKETPLACE (18.8u from H48)
-ASTEROID_BASE  = "X1-GK27-H48"     # Moon — MARKETPLACE + SHIPYARD (18.8 units from CD5A)
-SHIPYARD_WP    = "X1-GK27-H48"     # Primary shipyard
-SHIPYARD_WPS   = ["X1-GK27-H48", "X1-GK27-A2", "X1-GK27-C37"]  # All shipyards in system
+SYSTEM         = "X1-GK27"          # auto-set by auto_configure()
+COMMAND_SHIP   = "MASTERY-1"        # auto-set by auto_configure()
+ASTEROID       = "X1-GK27-CD5A"    # auto-set by auto_configure()
+ASTEROID_BASE  = "X1-GK27-H48"     # auto-set by auto_configure()
+SHIPYARD_WP    = "X1-GK27-H48"     # auto-set by auto_configure()
+SHIPYARD_WPS   = ["X1-GK27-H48", "X1-GK27-A2", "X1-GK27-C37"]  # auto-set by auto_configure()
+_FACTION_HQ_WP = "X1-GK27-A1"     # auto-set by auto_configure() — used for contract negotiation
 CREDIT_RESERVE = 30_000            # Minimum credits to keep in reserve
 MIN_BUY_CREDITS = 80_000           # Fleet manager starts buying once we clear this threshold
-FLEET_MANAGER_SHIP = "MASTERY-2"   # Idle non-miner ship kept at SHIPYARD_WP for background ops
-MIN_FUEL_CAPACITY  = 40            # Skip ships whose fuel tank can't cover the CD5A↔H48 route (~19u)
+FLEET_MANAGER_SHIP = "MASTERY-2"   # auto-set by auto_configure()
+MIN_FUEL_CAPACITY  = 40            # Skip ships whose fuel tank can't cover the asteroid↔base route
 
 # Ship purchase priority for mining contracts (higher score = buy first)
 # -1 means never buy; caps enforced in _bg_buy_and_launch
@@ -466,6 +467,124 @@ def nearest_refuel_point(from_wp: str) -> str:
     if best_wp != ASTEROID_BASE:
         log(f"[dim]Nearest fuel market to {from_wp}: {best_wp} (dist={best_dist:.0f})[/dim]")
     return best_wp
+
+
+# ── Auto-configuration ────────────────────────────────────────────────────────
+
+def auto_configure() -> None:
+    """Detect SYSTEM, COMMAND_SHIP, ASTEROID, ASTEROID_BASE, SHIPYARD_WP from the API.
+
+    Scores asteroids by trait quality (avoids STRIPPED), then picks the one
+    with the best traits that also has a nearby ASTEROID_BASE or marketplace
+    with fuel.  Falls back to current defaults on any error.
+    """
+    global SYSTEM, COMMAND_SHIP, FLEET_MANAGER_SHIP
+    global ASTEROID, ASTEROID_BASE, SHIPYARD_WP, SHIPYARD_WPS, _FACTION_HQ_WP
+
+    try:
+        agent    = agent_api.get_my_agent()
+        callsign = agent["symbol"]
+        hq       = agent["headquarters"]           # e.g. "X1-GK27-H48"
+        parts    = hq.split("-")
+        SYSTEM             = f"{parts[0]}-{parts[1]}"
+        COMMAND_SHIP       = f"{callsign}-1"
+        FLEET_MANAGER_SHIP = f"{callsign}-2"
+        log(f"[cyan]Agent: {callsign} | HQ: {hq} | System: {SYSTEM}[/cyan]")
+    except SpaceTradersError as e:
+        log(f"[yellow]auto_configure: agent query failed ({e}) — keeping defaults[/yellow]")
+        return
+
+    try:
+        waypoints = universe_api.get_waypoints(SYSTEM)
+    except SpaceTradersError as e:
+        log(f"[yellow]auto_configure: waypoint query failed ({e}) — keeping defaults[/yellow]")
+        return
+
+    ASTEROID_TYPES = {"ASTEROID", "ASTEROID_FIELD", "ENGINEERED_ASTEROID"}
+    TRAIT_SCORES: dict[str, int] = {
+        "STRIPPED":               -9999,
+        "PRECIOUS_METAL_DEPOSITS":   50,
+        "RARE_METAL_DEPOSITS":       40,
+        "COMMON_METAL_DEPOSITS":     20,
+        "MINERAL_DEPOSITS":          10,
+        "DEEP_CRATERS":              15,
+        "HOLLOWED_INTERIOR":          5,
+        "EXPLOSIVE_GASES":           -5,
+        "UNSTABLE_COMPOSITION":      -5,
+        "RADIOACTIVE":              -10,
+        "DEBRIS_CLUSTER":            -5,
+    }
+
+    coords:      dict[str, tuple[int, int]] = {}
+    traits_map:  dict[str, set[str]]        = {}
+    shipyards:   list[str]                  = []
+    base_wps:    list[str]                  = []   # ASTEROID_BASE type — purpose-built support
+    market_wps:  list[str]                  = []   # any marketplace (fallback base)
+    faction_hq:  str                        = hq
+
+    for wp in waypoints:
+        sym          = wp["symbol"]
+        coords[sym]  = (wp["x"], wp["y"])
+        wp_traits    = {t["symbol"] for t in wp.get("traits", [])}
+        traits_map[sym] = wp_traits
+        if wp["type"] == "ASTEROID_BASE":
+            base_wps.append(sym)
+        if "SHIPYARD" in wp_traits:
+            shipyards.append(sym)
+        if "MARKETPLACE" in wp_traits:
+            market_wps.append(sym)
+
+    # Prefer ASTEROID_BASE type as the mining support station; fall back to any market
+    base_candidates = base_wps if base_wps else market_wps
+
+    best_score    = -float("inf")
+    best_asteroid = None
+    best_base     = None
+
+    for wp in waypoints:
+        if wp["type"] not in ASTEROID_TYPES:
+            continue
+        sym    = wp["symbol"]
+        traits = traits_map.get(sym, set())
+        score  = sum(TRAIT_SCORES.get(t, 0) for t in traits)
+        if score <= -9000:          # STRIPPED — hard skip
+            continue
+
+        # Find nearest base candidate and add a proximity bonus
+        ax, ay               = coords[sym]
+        nearest_base, n_dist = None, float("inf")
+        for bc in base_candidates:
+            bx, by = coords[bc]
+            d = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+            if d < n_dist:
+                n_dist, nearest_base = d, bc
+
+        if n_dist < 100:
+            score += 20
+        elif n_dist < 300:
+            score += 10
+        elif n_dist > 500:
+            score -= 10
+
+        if score > best_score:
+            best_score    = score
+            best_asteroid = sym
+            best_base     = nearest_base
+
+    if best_asteroid:
+        ASTEROID      = best_asteroid
+        ASTEROID_BASE = best_base or hq
+        log(f"[cyan]Auto-configured asteroid: {ASTEROID} (score={best_score:.0f}) | base: {ASTEROID_BASE}[/cyan]")
+    else:
+        log(f"[yellow]No suitable asteroid found — keeping defaults ({ASTEROID})[/yellow]")
+
+    if shipyards:
+        SHIPYARD_WP  = shipyards[0]
+        SHIPYARD_WPS = shipyards
+        log(f"[cyan]Shipyards: {SHIPYARD_WPS}[/cyan]")
+
+    _FACTION_HQ_WP = faction_hq
+    log(f"[cyan]Faction HQ waypoint: {_FACTION_HQ_WP}[/cyan]")
 
 
 # ── Market intelligence ───────────────────────────────────────────────────────
@@ -1728,7 +1847,7 @@ def _bg_negotiate_contract() -> None:
         return
 
     try:
-        navigate_to(FLEET_MANAGER_SHIP, "X1-GK27-A1")
+        navigate_to(FLEET_MANAGER_SHIP, _FACTION_HQ_WP)
         ensure_docked(FLEET_MANAGER_SHIP)
         result = fleet_api.negotiate_contract(FLEET_MANAGER_SHIP)
         new_c  = result.get("contract", {})
@@ -2013,7 +2132,7 @@ def get_next_contract() -> dict | None:
     log("[yellow]No pending contracts — negotiating a new one...[/yellow]")
     try:
         # Need to be docked at a faction waypoint to negotiate
-        navigate_to(COMMAND_SHIP, "X1-GK27-A1")
+        navigate_to(COMMAND_SHIP, _FACTION_HQ_WP)
         ensure_docked(COMMAND_SHIP)
         result = fleet_api.negotiate_contract(COMMAND_SHIP)
         new_contract = result.get("contract", {})
@@ -2095,6 +2214,9 @@ def run() -> None:
         "Goal: Complete contracts → buy ships → upgrade → repeat indefinitely",
         border_style="cyan",
     ))
+
+    # Auto-configure system/ship/asteroid constants from the live API first
+    auto_configure()
 
     # Init DB and warm-start caches from previous run
     db.init_db()
