@@ -68,6 +68,7 @@ CREDIT_RESERVE = 30_000            # Minimum credits to keep in reserve
 MIN_BUY_CREDITS = 80_000           # Fleet manager starts buying once we clear this threshold
 AUTO_BUY_SHIPS  = False            # Set True to re-enable automated purchases; False = human-approved only
 CHEAP_BUY_THRESHOLD    = 200        # cr/unit — buy even mineable goods if market price is this low
+DRY_EXTRACT_THRESHOLD  = 15         # consecutive zero-hit extractions before forcing buy mode
 SELL_ROUTING_DIST_COST = 20         # cr per distance unit deducted from remote-market revenue (fuel + time proxy)
 MIN_CONTRACT_PAYOUT    = 30_000     # Skip contracts with onFulfilled < this and try to negotiate a better one
 FLEET_MANAGER_SHIP = "MASTERY-2"   # auto-set by auto_configure()
@@ -1653,6 +1654,7 @@ def _miner_loop_inner(
         ensure_orbit(ship_symbol)
         active_survey = (_get_shared_survey(good) if _use_shared_surveys else None) or try_survey(ship_symbol, good)
         _empty_loads = 0  # consecutive full cargo loads with 0 contract good
+        _dry_extractions = 0  # consecutive extractions yielding 0 of the contract good
 
     while not stop_event.is_set() and not contract_done.is_set():
         # Refresh active_survey from shared pool if we don't have one
@@ -1698,7 +1700,14 @@ def _miner_loop_inner(
             _direct_buy and _empty_loads >= 3
             and not contract_done.is_set()
         )
-        if _loop_space < 5 or (_have_cached > 0 and not _at_asteroid) or _skip_to_buy:
+        # Force buy mode early if many consecutive extractions yielded nothing
+        _force_buy = (
+            not _direct_buy
+            and _dry_extractions >= DRY_EXTRACT_THRESHOLD
+            and bool(best_buy_waypoint(good))
+            and not contract_done.is_set()
+        )
+        if _loop_space < 5 or (_have_cached > 0 and not _at_asteroid) or _skip_to_buy or _force_buy:
             # ── Stationary mode: offload everything to hauler when possible ───
             if _loop_space < 5 and _at_asteroid and _hauler_symbols:
                 _avail_hauler = _get_available_hauler(mining_target)
@@ -1724,6 +1733,7 @@ def _miner_loop_inner(
             if have > 0 and not contract_done.is_set():
                 if _empty_loads < 3:
                     _empty_loads = 0  # reset only when good was mined, not bought
+                _dry_extractions = 0  # good found — reset dry streak
                 # Cap delivery to remaining needed — API rejects over-delivery with 4508
                 try:
                     _fc = contracts_api.get_contract(cid)
@@ -1775,6 +1785,10 @@ def _miner_loop_inner(
                         ensure_orbit(ship_symbol)
             else:
                 # No contract good in cargo — junk run, then optionally buy the good
+                if _force_buy and _empty_loads < 3:
+                    log(f"[yellow]{ship_symbol}: {_dry_extractions} consecutive dry extractions — escalating to buy mode early[/yellow]")
+                    _empty_loads = 3
+                    _dry_extractions = 0
                 _empty_loads += 1
                 navigate_with_refuel(ship_symbol, ASTEROID_BASE)
                 ensure_docked(ship_symbol)
@@ -1892,6 +1906,10 @@ def _miner_loop_inner(
                 f"Cargo: {cargo.get('units')}/{cargo.get('capacity')} | "
                 f"CD: {cd}s"
             )
+            if yld.get("symbol") == good:
+                _dry_extractions = 0
+            else:
+                _dry_extractions += 1
             if yld.get("symbol"):
                 db.log_extraction(
                     mining_target, ship_symbol,
