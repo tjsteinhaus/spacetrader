@@ -217,6 +217,11 @@ CREATE TABLE IF NOT EXISTS agent_config (
     value         TEXT NOT NULL,
     PRIMARY KEY (callsign, key)
 );
+
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -253,6 +258,24 @@ def load_agent_config(callsign: str, path: Path | str | None = None) -> dict[str
             (callsign,),
         ).fetchall()
     return {k: v for k, v in rows}
+
+
+def get_bot_setting(key: str, default: str = "") -> str:
+    """Read a single bot control setting; returns default if not set."""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT value FROM bot_settings WHERE key = ?", (key,)
+        ).fetchone()
+    return row[0] if row else default
+
+
+def set_bot_setting(key: str, value: str) -> None:
+    """Persist a bot control setting to the database."""
+    with _conn() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
 
 
 # ---------------------------------------------------------------------------
