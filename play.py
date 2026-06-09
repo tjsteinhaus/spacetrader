@@ -67,8 +67,9 @@ _FACTION_HQ_WP = "X1-GK27-A1"     # auto-set by auto_configure() — used for co
 CREDIT_RESERVE = 30_000            # Minimum credits to keep in reserve
 MIN_BUY_CREDITS = 80_000           # Fleet manager starts buying once we clear this threshold
 AUTO_BUY_SHIPS  = False            # Set True to re-enable automated purchases; False = human-approved only
-CHEAP_BUY_THRESHOLD = 200          # cr/unit — buy even mineable goods if market price is this low
-MIN_CONTRACT_PAYOUT = 30_000       # Skip contracts with onFulfilled < this and try to negotiate a better one
+CHEAP_BUY_THRESHOLD    = 200        # cr/unit — buy even mineable goods if market price is this low
+SELL_ROUTING_DIST_COST = 20         # cr per distance unit deducted from remote-market revenue (fuel + time proxy)
+MIN_CONTRACT_PAYOUT    = 30_000     # Skip contracts with onFulfilled < this and try to negotiate a better one
 FLEET_MANAGER_SHIP = "MASTERY-2"   # auto-set by auto_configure()
 MIN_FUEL_CAPACITY  = 150           # Skip ships whose fuel tank can't cover the asteroid↔base route
 
@@ -956,7 +957,12 @@ def get_market_prices(waypoint: str) -> dict[str, int]:
 
 
 def best_sell_waypoint(good: str) -> tuple[str, int]:
-    """Return (waypoint, sell_price) for the market paying the most for `good`."""
+    """Return (waypoint, sell_price) for the market paying the most for `good`.
+
+    TODO (item 5): Adjust for distance — net revenue = sell_price * units - round_trip_distance
+    * SELL_ROUTING_DIST_COST.  Currently pure price comparison; a market 400 units away
+    paying 50 cr/unit more than base may still be worse after travel cost.
+    """
     best_wp, best_price = ASTEROID_BASE, 0
     for wp in (_known_markets or [ASTEROID_BASE]):
         price = get_market_prices(wp).get(good, 0)
@@ -968,7 +974,11 @@ def best_sell_waypoint(good: str) -> tuple[str, int]:
 def best_buy_waypoint(good: str) -> str:
     """Return the waypoint that exports/exchanges `good` (i.e. sells it to us).
     Prefers markets with a known price; falls back to any exporter in _good_exporters.
-    Skips waypoints in _buy_source_blacklist until their cooldown expires."""
+    Skips waypoints in _buy_source_blacklist until their cooldown expires.
+
+    TODO (item 5): Weight by net cost = buy_price + round_trip_distance * SELL_ROUTING_DIST_COST.
+    Cheapest source isn't always best when a slightly pricier nearby market saves significant travel.
+    """
     now = time.time()
     available = [wp for wp in _good_exporters.get(good, [])
                  if _buy_source_blacklist.get(wp, 0) <= now]
@@ -1017,8 +1027,7 @@ def best_sell_market_for_cargo(inventory: list[dict]) -> str:
         return ASTEROID_BASE
 
     # Identify the "base cluster": markets co-located with ASTEROID_BASE (≤5 units away).
-    # These are free to visit since we refuel there anyway (e.g. H51 and H53 at H52's coords).
-    bx, by = _get_coords(ASTEROID_BASE)
+    # These are free to visit since we refuel there anyway (e.g. H51 and H53 at H52's coords).    bx, by = _get_coords(ASTEROID_BASE)
     cluster_val = 0
     cluster_best = ASTEROID_BASE
     for wp, val in market_values.items():
@@ -1027,24 +1036,32 @@ def best_sell_market_for_cargo(inventory: list[dict]) -> str:
             if val > cluster_val:
                 cluster_val, cluster_best = val, wp
 
-    # Find globally best market across all candidates
-    best_market, best_val = cluster_best, cluster_val
-    for wp, val in market_values.items():
-        if val > best_val:
-            best_val, best_market = val, wp
+    # Score every candidate by net value = raw revenue minus round-trip travel cost.
+    # Cluster markets (≤5 units from ASTEROID_BASE) get zero penalty — we're going
+    # there to refuel anyway.  Remote markets must sell FUEL and must beat the cluster
+    # on net value to justify the extra trip.
+    fuel_markets = set(_good_exporters.get("FUEL", []))
+    best_net_wp, best_net_val = cluster_best, cluster_val
+    for wp, raw_val in market_values.items():
+        wx, wy = _get_coords(wp)
+        dist = ((wx - bx) ** 2 + (wy - by) ** 2) ** 0.5
+        if dist < 5:
+            continue  # already captured in cluster_val/cluster_best above
+        if wp not in fuel_markets:
+            continue  # can't safely refuel for return trip — skip
+        net_val = raw_val - dist * 2 * SELL_ROUTING_DIST_COST  # round-trip penalty
+        if net_val > best_net_val:
+            best_net_val = net_val
+            best_net_wp  = wp
 
-    # Only reroute to a remote market if it beats the cluster by both >20% relative
-    # AND ≥500 cr absolute — prevents burning 4+ min travel for marginal gains.
-    # Also require the remote market sells FUEL so we can refuel before heading back.
-    if best_market != cluster_best:
-        abs_gain = best_val - cluster_val
-        if best_val > cluster_val * 1.20 and abs_gain >= 500:
-            fuel_markets = set(_good_exporters.get("FUEL", []))
-            if best_market in fuel_markets:
-                log(f"[dim]Routing to {best_market} (est. {best_val:,} cr vs {cluster_val:,} cr at cluster)[/dim]")
-                return best_market
-            else:
-                log(f"[dim]Skipping {best_market} — no fuel sold there, selling at cluster instead[/dim]")
+    if best_net_wp != cluster_best:
+        travel_penalty = market_values[best_net_wp] - best_net_val
+        log(
+            f"[dim]Sell routing: {best_net_wp} net {best_net_val:,} cr "
+            f"(raw {market_values[best_net_wp]:,} − {travel_penalty:,} travel cost) "
+            f"vs cluster {cluster_val:,} cr[/dim]"
+        )
+        return best_net_wp
 
     return cluster_best
 
@@ -1294,6 +1311,12 @@ def surveyor_loop(
     """
     Dedicated surveyor thread. Navigates to B8, then continuously surveys the
     asteroid and publishes results to the shared pool for miners to consume.
+
+    TODO (item 4): Target the asteroid that active miners are assigned to (the result
+    of choose_mining_target for the lead miner) rather than always using the global
+    ASTEROID.  Surveys are asteroid-specific — surveying the wrong asteroid wastes the
+    surveyor when miners have been routed to a different target.  If miners are split,
+    follow the asteroid with the most miners assigned to it.
     """
     try:
         _surveyor_loop_inner(ship_symbol, contract, contract_done, stop_event)
@@ -2071,7 +2094,7 @@ def _bg_buy_and_launch(
     current_haulers   = len(_hauler_symbols)
 
     def _should_buy(stype: str) -> bool:
-        if ship_score(stype, current_miners) < 0:
+        if ship_score(stype, current_miners, current_surveyors, current_haulers) < 0:
             return False
         _role_count = {
             "SHIP_ORE_HOUND":       current_miners,
@@ -2391,19 +2414,48 @@ def work_contract(contract: dict) -> None:
 
 # ── Ship buying ───────────────────────────────────────────────────────────────
 
-def ship_score(ship_type: str, current_miner_count: int) -> int:
+def ship_score(
+    ship_type: str,
+    current_miner_count: int,
+    current_surveyor_count: int = 0,
+    current_hauler_count: int = 0,
+) -> int:
     """
-    Score a ship type. Higher = more desirable to buy.
+    Score a ship type for purchase priority.  Higher = more desirable to buy.
     -1 means skip entirely.
-    Haulers/transports are blocked until we have 2+ miners.
+
+    Dynamic adjustments based on current fleet composition:
+    - Haulers: blocked until 2+ miners; priority rises with miner count so that
+      once 3+ miners are wasting time on delivery runs a hauler jumps above extra miners.
+    - Surveyors: blocked until 2+ miners (need miners to share the survey pool);
+      capped at 1 surveyor.
+    - Miners: slight score reduction above 5 (diminishing returns).
     """
     base = SHIP_SCORES.get(ship_type, 30)  # unknown types get a mediocre score
     if base < 0:
         return -1
-    # Never buy haulers/transports until we have at least 2 miners
+
     _hauler_types = ("SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER", "SHIP_LIGHT_SHUTTLE")
-    if ship_type in _hauler_types and current_miner_count < 2:
-        return -1
+
+    if ship_type in _hauler_types:
+        if current_miner_count < 2 or current_hauler_count >= 1:
+            return -1
+        # With 3+ miners each delivery run wastes mining time — hauler frees that up.
+        # Boost score above extra miners once we reach that threshold.
+        if current_miner_count >= 3:
+            return base + (current_miner_count - 2) * 15
+        return base
+
+    if ship_type == "SHIP_SURVEYOR":
+        if current_miner_count < 2 or current_surveyor_count >= 1:
+            return -1  # not enough miners to share surveys / already have one
+        return base
+
+    if ship_type in ("SHIP_ORE_HOUND", "SHIP_MINING_DRONE"):
+        if current_miner_count >= 5:
+            return max(base - 30, 10)  # diminishing returns above 5 miners
+        return base
+
     return base
 
 
@@ -2435,7 +2487,7 @@ def buy_ships() -> int:
     purchases = 0
 
     def _eligible(stype: str) -> bool:
-        if ship_score(stype, current_miners) < 0:
+        if ship_score(stype, current_miners, current_surveyors, current_haulers) < 0:
             return False
         _role_count = {
             "SHIP_ORE_HOUND":       current_miners,
@@ -2483,7 +2535,7 @@ def buy_ships() -> int:
         t.add_column("Supply")
         t.add_column("Priority", justify="right")
         for s in ships_for_sale:
-            sc = ship_score(s.get("type", ""), current_miners)
+            sc = ship_score(s.get("type", ""), current_miners, current_surveyors, current_haulers)
             price = s.get("purchasePrice", 0)
             can_afford = "[green]✓[/green]" if credits - price >= CREDIT_RESERVE else "[red]✗[/red]"
             priority = str(sc) if sc >= 0 else "[dim]skip[/dim]"
@@ -2493,7 +2545,7 @@ def buy_ships() -> int:
         # Buy greedily in priority order, skipping anything we can't afford
         buyable = sorted(
             [s for s in ships_for_sale if _eligible(s.get("type", ""))],
-            key=lambda s: ship_score(s.get("type", ""), current_miners),
+            key=lambda s: ship_score(s.get("type", ""), current_miners, current_surveyors, current_haulers),
             reverse=True,
         )
 
@@ -2562,15 +2614,82 @@ def _is_buyable_contract(c: dict) -> bool:
     return bool(best_buy_waypoint(good))
 
 
+def _contract_score(c: dict) -> float:
+    """Weighted efficiency score for choosing between contracts.
+
+    Factors (all affect a base payout-per-unit-remaining value):
+    - Payout per remaining unit  — favours small high-value contracts over large cheap ones
+    - +20% resource match bonus  — any scored asteroid has the right deposit trait
+    - -15% non-mineable penalty  — purchased goods carry overhead vs free mining
+    - Delivery distance penalty  — far delivery WP costs more fuel/time per cycle
+
+    Used only when selecting UNACCEPTED contracts; accepted contracts are always resumed.
+    """
+    payout = _contract_payout(c)
+    d = (c.get("terms", {}).get("deliver") or [{}])[0]
+    good            = d.get("tradeSymbol", "")
+    units_remaining = max(d.get("unitsRequired", 1) - d.get("unitsFulfilled", 0), 1)
+    delivery_wp     = d.get("destinationSymbol", ASTEROID_BASE)
+
+    payout_per_unit = float(payout) / units_remaining
+
+    # Resource match bonus: any known asteroid has the deposit trait for this good
+    _populate_asteroid_cache()
+    deposit_traits = GOOD_TO_DEPOSIT_TRAITS.get(good, frozenset())
+    has_match = bool(deposit_traits) and any(
+        deposit_traits & ast["traits"] for ast in _scored_asteroids
+    )
+    if has_match:
+        payout_per_unit *= 1.20
+
+    # Non-mineable goods must be purchased — lower effective margin
+    if good not in MINEABLE_GOODS:
+        payout_per_unit *= 0.85
+
+    # Delivery distance penalty: far WP = more fuel + time per run
+    try:
+        ax, ay = _get_coords(ASTEROID)
+        dx, dy = _get_coords(delivery_wp)
+        dist_delivery = ((ax - dx) ** 2 + (ay - dy) ** 2) ** 0.5
+        payout_per_unit -= dist_delivery * 0.3
+    except Exception:
+        pass
+
+    return payout_per_unit
+
+
+def _log_contract_scores(contracts: list[dict]) -> None:
+    """Log a scoring breakdown table for a list of unaccepted contracts."""
+    if len(contracts) < 2:
+        return  # nothing to compare
+    rows = []
+    for c in contracts:
+        d = (c.get("terms", {}).get("deliver") or [{}])[0]
+        good     = d.get("tradeSymbol", "?")
+        req      = d.get("unitsRequired", 0)
+        done     = d.get("unitsFulfilled", 0)
+        payout   = _contract_payout(c)
+        score    = _contract_score(c)
+        deposit_traits = GOOD_TO_DEPOSIT_TRAITS.get(good, frozenset())
+        match_str = "[green]✓[/green]" if bool(deposit_traits) and any(
+            deposit_traits & ast["traits"] for ast in _scored_asteroids
+        ) else "–"
+        rows.append((score, good, req, done, payout, match_str))
+    rows.sort(reverse=True)
+    log("[dim]Contract scoring (best efficiency first):[/dim]")
+    for score, good, req, done, payout, match in rows:
+        log(f"[dim]  {good} ×{req} ({done} done) | {payout:,} cr | score={score:.0f} | deposit={match}[/dim]")
+
+
 def get_next_contract() -> dict | None:
-    """Return an unfulfilled contract, prioritising high-value ones.
+    """Return an unfulfilled contract, prioritising by weighted efficiency score.
 
     Priority order:
       1. Already-accepted contracts — committed, must finish them.
-      2. Unaccepted high-value contracts (onFulfilled >= MIN_CONTRACT_PAYOUT).
-         Best payout wins; type (mining vs buyable) doesn't matter.
+      2. Unaccepted high-value contracts (onFulfilled >= MIN_CONTRACT_PAYOUT),
+         ranked by _contract_score (payout/unit, resource match, delivery distance).
       3. Negotiate a fresh contract hoping for a high-value one.
-      4. Fall back to the highest-payout unaccepted contract available.
+      4. Fall back to the best-scoring unaccepted contract available.
          If still nothing, accept whatever was negotiated.
     """
     cs = contracts_api.get_contracts()
@@ -2596,15 +2715,17 @@ def get_next_contract() -> dict | None:
     unaccepted = [c for c in pending if not c.get("accepted")]
     good_unaccepted = [c for c in unaccepted if _contract_payout(c) >= MIN_CONTRACT_PAYOUT]
     if good_unaccepted:
-        chosen = max(good_unaccepted, key=_contract_payout)
+        _log_contract_scores(good_unaccepted)
+        chosen = max(good_unaccepted, key=_contract_score)
         payout = _contract_payout(chosen)
-        good = _contract_good(chosen)
-        log(f"[green]High-value contract available: {good} (+{payout:,} cr on fulfill)[/green]")
+        good   = _contract_good(chosen)
+        score  = _contract_score(chosen)
+        log(f"[green]Contract selected: {good} (+{payout:,} cr | score={score:.0f})[/green]")
         return chosen
 
     # 3. No high-value contracts on hand — try negotiating a fresh one.
     if unaccepted:
-        best_available = max(unaccepted, key=_contract_payout)
+        best_available = max(unaccepted, key=_contract_score)
         log(f"[yellow]Best available contract only pays {_contract_payout(best_available):,} cr — trying to negotiate a better one...[/yellow]")
     else:
         best_available = None
