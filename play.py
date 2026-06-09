@@ -82,6 +82,43 @@ MINEABLE_GOODS: frozenset[str] = frozenset({
     "HYDROCARBON",
 })
 
+# Quality score for each asteroid deposit trait — used when scoring & ranking asteroids.
+_ASTEROID_TRAIT_SCORES: dict[str, int] = {
+    "STRIPPED":                -9999,
+    "PRECIOUS_METAL_DEPOSITS":    50,
+    "RARE_METAL_DEPOSITS":        40,
+    "COMMON_METAL_DEPOSITS":      20,
+    "MINERAL_DEPOSITS":           10,
+    "DEEP_CRATERS":               15,
+    "HOLLOWED_INTERIOR":           5,
+    "EXPLOSIVE_GASES":            -5,
+    "UNSTABLE_COMPOSITION":       -5,
+    "RADIOACTIVE":               -10,
+    "DEBRIS_CLUSTER":             -5,
+}
+
+# Maps each mineable good to the asteroid deposit trait(s) that signal it's present.
+# Used by choose_mining_target() to prioritise asteroids that actually yield the contract good.
+GOOD_TO_DEPOSIT_TRAITS: dict[str, frozenset[str]] = {
+    "IRON_ORE":         frozenset({"COMMON_METAL_DEPOSITS"}),
+    "COPPER_ORE":       frozenset({"COMMON_METAL_DEPOSITS"}),
+    "ALUMINUM_ORE":     frozenset({"COMMON_METAL_DEPOSITS"}),
+    "SILVER_ORE":       frozenset({"PRECIOUS_METAL_DEPOSITS"}),
+    "GOLD_ORE":         frozenset({"PRECIOUS_METAL_DEPOSITS"}),
+    "PRECIOUS_STONES":  frozenset({"PRECIOUS_METAL_DEPOSITS"}),
+    "DIAMONDS":         frozenset({"PRECIOUS_METAL_DEPOSITS", "RARE_METAL_DEPOSITS"}),
+    "PLATINUM_ORE":     frozenset({"RARE_METAL_DEPOSITS"}),
+    "URANITE_ORE":      frozenset({"RARE_METAL_DEPOSITS"}),
+    "MERITIUM_ORE":     frozenset({"RARE_METAL_DEPOSITS", "PRECIOUS_METAL_DEPOSITS"}),
+    "SILICON_CRYSTALS": frozenset({"MINERAL_DEPOSITS"}),
+    "QUARTZ_SAND":      frozenset({"MINERAL_DEPOSITS"}),
+    "AMMONIA_ICE":      frozenset({"MINERAL_DEPOSITS"}),
+    "ICE_WATER":        frozenset({"MINERAL_DEPOSITS"}),
+    "LIQUID_HYDROGEN":  frozenset({"EXPLOSIVE_GASES"}),
+    "LIQUID_NITROGEN":  frozenset({"EXPLOSIVE_GASES"}),
+    "HYDROCARBON":      frozenset({"EXPLOSIVE_GASES"}),
+}
+
 # Ship purchase priority for mining contracts (higher score = buy first)
 # -1 means never buy; caps enforced in _bg_buy_and_launch
 # Rule: miners first → surveyors → haulers only once we have 2+ miners
@@ -502,6 +539,190 @@ def nearest_refuel_point(from_wp: str) -> str:
     if best_wp != ASTEROID_BASE:
         log(f"[dim]Nearest fuel market to {from_wp}: {best_wp} (dist={best_dist:.0f})[/dim]")
     return best_wp
+
+
+# ── Asteroid scoring & mining target selection ────────────────────────────────
+
+# Populated lazily on first contract; read-only after that (safe under threading).
+_scored_asteroids: list[dict] = []                   # [{symbol, x, y, traits, trait_score, nearest_base, base_dist}]
+_asteroid_traits:  dict[str, frozenset[str]] = {}    # {symbol -> frozenset of trait symbols}
+
+
+def _populate_asteroid_cache() -> None:
+    """Build _scored_asteroids and _asteroid_traits from DB (or API fallback).
+    Idempotent — no-op if already populated.
+    """
+    global _scored_asteroids, _asteroid_traits
+    if _scored_asteroids:
+        return
+
+    _ASTEROID_TYPES_LOCAL = {"ASTEROID", "ASTEROID_FIELD", "ENGINEERED_ASTEROID"}
+
+    waypoints = db.get_all_waypoints(SYSTEM)
+    if not waypoints:
+        try:
+            waypoints = universe_api.get_waypoints(SYSTEM)
+        except SpaceTradersError as e:
+            log(f"[yellow]_populate_asteroid_cache: waypoint fetch failed ({e})[/yellow]")
+            return
+
+    coords:          dict[str, tuple[int, int]] = {}
+    traits_map:      dict[str, frozenset[str]]  = {}
+    base_candidates: list[str]                  = []
+    market_wps:      list[str]                  = []
+
+    for wp in waypoints:
+        sym = wp["symbol"]
+        coords[sym] = (wp.get("x", 0), wp.get("y", 0))
+        wp_traits = frozenset(t["symbol"] for t in wp.get("traits", []))
+        traits_map[sym] = wp_traits
+        if wp["type"] == "ASTEROID_BASE":
+            base_candidates.append(sym)
+        if "MARKETPLACE" in wp_traits:
+            market_wps.append(sym)
+
+    if not base_candidates:
+        base_candidates = market_wps or [ASTEROID_BASE]
+
+    results: list[dict] = []
+    for wp in waypoints:
+        if wp["type"] not in _ASTEROID_TYPES_LOCAL:
+            continue
+        sym    = wp["symbol"]
+        traits = traits_map.get(sym, frozenset())
+        score  = sum(_ASTEROID_TRAIT_SCORES.get(t, 0) for t in traits)
+        if score <= -9000:
+            continue  # STRIPPED
+
+        ax, ay               = coords[sym]
+        nearest_base, n_dist = ASTEROID_BASE, float("inf")
+        for bc in base_candidates:
+            bx, by = coords.get(bc, (0, 0))
+            d = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+            if d < n_dist:
+                n_dist, nearest_base = d, bc
+
+        results.append({
+            "symbol":       sym,
+            "x":            ax,
+            "y":            ay,
+            "traits":       traits,
+            "trait_score":  score,
+            "nearest_base": nearest_base,
+            "base_dist":    n_dist,
+        })
+        _wp_coords[sym] = (ax, ay)  # seed coordinate cache
+
+    _scored_asteroids[:] = results
+    _asteroid_traits.update({r["symbol"]: r["traits"] for r in results})
+    log(f"[dim]Asteroid cache: {len(_scored_asteroids)} candidates loaded[/dim]")
+
+
+def score_asteroid_for_miner(
+    ast: dict,
+    contract_good: str,
+    ship_x: int,
+    ship_y: int,
+    ship_fuel_cap: int,
+    delivery_wp: str,
+) -> float:
+    """Score a single asteroid for a specific miner + contract.
+
+    Factors (all additive):
+    - Base trait quality   (_ASTEROID_TRAIT_SCORES sum)
+    - +80  resource match: asteroid has the deposit trait for contract_good
+    - Fuel efficiency:     round-trip to nearest base vs ship fuel capacity
+    - Distance from ship:  initial travel cost to reach the asteroid
+    - Delivery proximity:  minor bonus/penalty based on asteroid → delivery distance
+    """
+    score = float(ast["trait_score"])
+
+    # Resource match — highest-weight factor
+    deposit_traits = GOOD_TO_DEPOSIT_TRAITS.get(contract_good, frozenset())
+    if deposit_traits & ast["traits"]:
+        score += 80.0
+
+    # Fuel efficiency: round-trip asteroid ↔ nearest refuel base
+    round_trip = ast["base_dist"] * 2.0
+    if ship_fuel_cap > 0:
+        ratio = round_trip / ship_fuel_cap
+        if ratio <= 1.0:
+            score += 20.0   # fits in one tank — very efficient
+        elif ratio <= 2.0:
+            score -= 10.0   # one refuel stop each way
+        elif ratio <= 4.0:
+            score -= 35.0   # two+ refuel stops — costly for small ships
+        else:
+            score -= 80.0   # extremely far; major inefficiency
+
+    # Distance from ship's current position (initial travel cost)
+    dist_from_ship = ((ast["x"] - ship_x) ** 2 + (ast["y"] - ship_y) ** 2) ** 0.5
+    if dist_from_ship < 50:
+        score += 15.0
+    elif dist_from_ship > 200:
+        score -= 10.0
+
+    # Delivery proximity (minor — asteroid closer to delivery WP = shorter trips)
+    dx, dy = _get_coords(delivery_wp)
+    dist_to_delivery = ((ast["x"] - dx) ** 2 + (ast["y"] - dy) ** 2) ** 0.5
+    if dist_to_delivery < 100:
+        score += 10.0
+    elif dist_to_delivery > 500:
+        score -= 10.0
+
+    return score
+
+
+def choose_mining_target(ship_symbol: str, contract: dict) -> str:
+    """Return the best asteroid waypoint for this miner + contract.
+
+    Scores all known asteroids by resource trait match, fuel round-trip efficiency,
+    current ship position, and delivery proximity.  Logs the top 3 candidates so
+    the reasoning is visible in the console.
+
+    Called at miner thread startup — naturally re-evaluated on every new contract.
+    Falls back to the global ASTEROID if the scored cache is empty.
+    """
+    d           = contract["terms"]["deliver"][0]
+    good        = d["tradeSymbol"]
+    delivery_wp = d["destinationSymbol"]
+
+    if good not in MINEABLE_GOODS:
+        return ASTEROID  # non-mineable goods are purchased; no asteroid routing needed
+
+    _populate_asteroid_cache()
+
+    if not _scored_asteroids:
+        log(f"[yellow]{ship_symbol}: asteroid cache empty — using default {ASTEROID}[/yellow]")
+        return ASTEROID
+
+    try:
+        ship     = fleet_api.get_ship(ship_symbol)
+        fuel     = ship["fuel"]
+        ship_x, ship_y = _get_coords(ship["nav"]["waypointSymbol"])
+        fuel_cap = fuel.get("capacity", 0)
+    except SpaceTradersError as e:
+        log(f"[yellow]{ship_symbol}: choose_mining_target ship fetch failed ({e}) — using default[/yellow]")
+        return ASTEROID
+
+    scored = sorted(
+        (
+            (score_asteroid_for_miner(ast, good, ship_x, ship_y, fuel_cap, delivery_wp), ast)
+            for ast in _scored_asteroids
+        ),
+        key=lambda t: t[0],
+        reverse=True,
+    )
+
+    deposit_traits = GOOD_TO_DEPOSIT_TRAITS.get(good, frozenset())
+    log(f"[cyan]{ship_symbol}: mining target for [bold]{good}[/bold] (fuel cap={fuel_cap}) — top candidates:[/cyan]")
+    for rank, (sc, ast) in enumerate(scored[:3], 1):
+        match_str = "[green]✓ match[/green]" if deposit_traits & ast["traits"] else "no match"
+        log(f"[dim]  #{rank} {ast['symbol']}  score={sc:.0f}  base_dist={ast['base_dist']:.0f}  {match_str}[/dim]")
+
+    best = scored[0][1]["symbol"]
+    log(f"[cyan]{ship_symbol}: → mining at [bold]{best}[/bold][/cyan]")
+    return best
 
 
 # ── Auto-configuration ────────────────────────────────────────────────────────
@@ -1331,6 +1552,11 @@ def _miner_loop_inner(
     good = d["tradeSymbol"]
     delivery_wp = d["destinationSymbol"]
 
+    # Choose the best asteroid for this miner + contract (re-evaluated fresh per contract).
+    mining_target       = choose_mining_target(ship_symbol, contract)
+    # Shared surveys are generated at the default ASTEROID; skip them if we're mining elsewhere.
+    _use_shared_surveys = (mining_target == ASTEROID)
+
     log(f"[cyan]⚓ {ship_symbol} thread started | mining: {good} → {delivery_wp}[/cyan]")
 
     # Safe startup: if not near the asteroid or fuel < 50%, refuel at ASTEROID_BASE first
@@ -1338,7 +1564,7 @@ def _miner_loop_inner(
     _wp0 = _s0["nav"]["waypointSymbol"]
     _f0 = _s0["fuel"]
     _fuel_pct0 = _f0["current"] / max(_f0["capacity"], 1) if _f0.get("capacity", 0) > 0 else 1.0
-    if _fuel_pct0 < 0.90 and _wp0 != ASTEROID:
+    if _fuel_pct0 < 0.90 and _wp0 != mining_target:
         log(f"[dim]{ship_symbol}: preflight refuel at {ASTEROID_BASE} (wp={_wp0}, fuel={_f0['current']}/{_f0['capacity']})[/dim]")
         if _wp0 != ASTEROID_BASE:
             navigate_with_refuel(ship_symbol, ASTEROID_BASE)
@@ -1400,20 +1626,20 @@ def _miner_loop_inner(
         active_survey = None
         _empty_loads = 3  # trigger buy on first loop iteration
     else:
-        navigate_with_refuel(ship_symbol, ASTEROID)
+        navigate_with_refuel(ship_symbol, mining_target)
         ensure_orbit(ship_symbol)
-        active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
+        active_survey = (_get_shared_survey(good) if _use_shared_surveys else None) or try_survey(ship_symbol, good)
         _empty_loads = 0  # consecutive full cargo loads with 0 contract good
 
     while not stop_event.is_set() and not contract_done.is_set():
         # Refresh active_survey from shared pool if we don't have one
         if active_survey is None:
-            active_survey = _get_shared_survey(good)
+            active_survey = _get_shared_survey(good) if _use_shared_surveys else None
 
         # ── Proactive fuel + condition check (one API call) ───────────────────
         _loop_ship = fleet_api.get_ship(ship_symbol)
         _fuel = _loop_ship["fuel"]
-        _at_asteroid = _loop_ship["nav"].get("waypointSymbol") == ASTEROID
+        _at_asteroid = _loop_ship["nav"].get("waypointSymbol") == mining_target
         # Only refuel if NOT already at the asteroid — mining costs no fuel, so
         # let small ships (80-cap) mine a full load before drifting back to B7.
         if not _at_asteroid and _fuel.get("capacity", 0) > 0 and _fuel["current"] / _fuel["capacity"] < 0.40:
@@ -1424,18 +1650,18 @@ def _miner_loop_inner(
             # In direct-buy mode (or if we already have cargo) let the main
             # loop decide where to go next — don't detour back to the asteroid.
             if not _direct_buy:
-                navigate_with_refuel(ship_symbol, ASTEROID)
+                navigate_with_refuel(ship_symbol, mining_target)
                 ensure_orbit(ship_symbol)
-                active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
+                active_survey = (_get_shared_survey(good) if _use_shared_surveys else None) or try_survey(ship_symbol, good)
 
         # ── Proactive repair check: detour to shipyard if condition degraded ──
         if needs_repair(_loop_ship):
             _cond = min(_condition(_loop_ship.get(c, {})) for c in ("frame", "engine", "reactor"))
             log(f"[yellow]🔧 {ship_symbol}: condition {_cond:.0%} below threshold — diverting to repair[/yellow]")
             repair_ship(ship_symbol)
-            navigate_with_refuel(ship_symbol, ASTEROID)
+            navigate_with_refuel(ship_symbol, mining_target)
             ensure_orbit(ship_symbol)
-            active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
+            active_survey = (_get_shared_survey(good) if _use_shared_surveys else None) or try_survey(ship_symbol, good)
 
         # ── Cargo almost full OR have contract good while not at asteroid ─────
         _loop_cargo = _loop_ship["cargo"]
@@ -1452,7 +1678,7 @@ def _miner_loop_inner(
         if _loop_space < 5 or (_have_cached > 0 and not _at_asteroid) or _skip_to_buy:
             # ── Stationary mode: offload everything to hauler when possible ───
             if _loop_space < 5 and _at_asteroid and _hauler_symbols:
-                _avail_hauler = _get_available_hauler(ASTEROID)
+                _avail_hauler = _get_available_hauler(mining_target)
                 if _avail_hauler:
                     _transferred = 0
                     for _item in list(_loop_cargo.get("inventory", [])):
@@ -1522,7 +1748,7 @@ def _miner_loop_inner(
                     ensure_docked(ship_symbol)
                     refuel_if_needed(ship_symbol, threshold=100_000)  # fill to max
                     if not _direct_buy:
-                        navigate_with_refuel(ship_symbol, ASTEROID)
+                        navigate_with_refuel(ship_symbol, mining_target)
                         ensure_orbit(ship_symbol)
             else:
                 # No contract good in cargo — junk run, then optionally buy the good
@@ -1588,9 +1814,9 @@ def _miner_loop_inner(
                                     # for income so we don't tight-loop or stall the contract.
                                     log(f"[yellow]{ship_symbol}: mining for income to fund direct-buy contract[/yellow]")
                                     _empty_loads = 0  # exit buy mode; mine 3 loads then retry
-                                    navigate_with_refuel(ship_symbol, ASTEROID)
+                                    navigate_with_refuel(ship_symbol, mining_target)
                                     ensure_orbit(ship_symbol)
-                                    active_survey = _get_shared_survey(good) or try_survey(ship_symbol, good)
+                                    active_survey = (_get_shared_survey(good) if _use_shared_surveys else None) or try_survey(ship_symbol, good)
                         else:
                             log(f"[yellow]{ship_symbol}: {good} not found in {_buy_wp} tradeGoods — blacklisting for 20 min[/yellow]")
                             _buy_source_blacklist[_buy_wp] = time.time() + 1200  # 20-minute cooldown
@@ -1601,7 +1827,7 @@ def _miner_loop_inner(
                             return
 
                 if not _direct_buy:
-                    navigate_with_refuel(ship_symbol, ASTEROID)
+                    navigate_with_refuel(ship_symbol, mining_target)
                     ensure_orbit(ship_symbol)
             continue
 
@@ -1645,7 +1871,7 @@ def _miner_loop_inner(
             )
             if yld.get("symbol"):
                 db.log_extraction(
-                    ASTEROID, ship_symbol,
+                    mining_target, ship_symbol,
                     active_survey.get("signature") if active_survey else None,
                     yld["symbol"], yld.get("units", 0),
                 )
