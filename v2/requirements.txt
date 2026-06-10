@@ -1,0 +1,7 @@
+aiohttp>=3.9.0
+pydantic>=2.0.0
+rich>=13.7.0
+python-dotenv>=1.0.0
+mcp>=1.0.0
+textual>=0.80.0
+aioconsole>=0.7.0

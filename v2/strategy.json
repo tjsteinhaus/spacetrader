@@ -1,0 +1,7 @@
+{
+  "strategy": "contract_grind",
+  "min_contract_payout": 30000,
+  "ship_role_overrides": {
+    "TYLERMASTERY2-5": "trader"
+  }
+}

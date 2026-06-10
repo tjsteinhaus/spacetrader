@@ -1,15 +1,11 @@
 """
-db.py — Persistent SQLite cache for SpaceTraders game state.
+db.py — Persistent SQLite cache for SpaceTraders game state (v2).
 
 Stores waypoints, market listings, market prices, contracts, surveys, and
 transaction history so the bot can warm-start without re-fetching everything
 and status.py can answer sourcing questions instantly.
 
-Usage:
-    import db
-    db.init_db()                         # create tables + seed static data
-    db.upsert_waypoints(waypoints_list)  # from universe_api.get_waypoints()
-    loaded = db.load_market_caches()     # warm-start play.py in-memory dicts
+v2 uses its own game_data.db inside the v2/ folder, separate from v1.
 """
 from __future__ import annotations
 
@@ -18,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+# v2 stores its own DB inside the v2/ folder — never conflicts with v1.
 DB_PATH = Path(__file__).parent / "game_data.db"
 
 # ---------------------------------------------------------------------------
@@ -71,16 +68,24 @@ SMELTED_GOODS = {
 
 
 # ---------------------------------------------------------------------------
-# Connection
+# Connection — single persistent connection per DB path
 # ---------------------------------------------------------------------------
+
+_connections: dict[str, sqlite3.Connection] = {}
 
 def _conn(path: Path | str | None = None) -> sqlite3.Connection:
     p = str(path or DB_PATH)
-    con = sqlite3.connect(p, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA foreign_keys=ON")
-    return con
+    if p not in _connections:
+        con = sqlite3.connect(p, check_same_thread=False, timeout=10)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA synchronous=NORMAL")
+        _connections[p] = con
+    else:
+        _connections[p].row_factory = sqlite3.Row
+    return _connections[p]
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +235,9 @@ CREATE TABLE IF NOT EXISTS bot_settings (
 def init_db(path: Path | str | None = None) -> None:
     """Create all tables and seed static deposit_goods data. Safe to call multiple times."""
     with _conn(path) as con:
+        # Checkpoint the WAL file on startup to prevent large WAL from slowing
+        # subsequent connections (4MB+ WAL causes measurable blocking)
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         con.executescript(_SCHEMA)
         # Migrate existing contracts table — add timing columns if absent
         existing = {r[1] for r in con.execute("PRAGMA table_info(contracts)").fetchall()}
@@ -452,6 +460,24 @@ def upsert_contract(contract: dict[str, Any], path: Path | str | None = None) ->
                         d.get("unitsFulfilled", 0),
                     ),
                 )
+
+
+def update_contract_deliverable(
+    contract_id: str, trade_symbol: str, units_fulfilled: int,
+    path: Path | str | None = None,
+) -> None:
+    """Update units_fulfilled for a specific contract deliverable."""
+    with _conn(path) as con:
+        con.execute(
+            """UPDATE contract_deliverables
+               SET units_fulfilled = ?
+               WHERE contract_id = ? AND trade_symbol = ?""",
+            (units_fulfilled, contract_id, trade_symbol),
+        )
+        con.execute(
+            "UPDATE contracts SET last_updated = ? WHERE id = ?",
+            (time.time(), contract_id),
+        )
 
 
 def upsert_survey(survey: dict[str, Any], path: Path | str | None = None) -> None:
@@ -735,6 +761,15 @@ def get_active_contracts(path: Path | str | None = None) -> list[dict[str, Any]]
                 ],
             })
     return result
+
+
+def get_waypoint_coords(symbol: str, path: Path | str | None = None) -> tuple[int, int] | None:
+    """Return (x, y) for a waypoint symbol if stored in DB, else None."""
+    with _conn(path) as con:
+        row = con.execute(
+            "SELECT x, y FROM waypoints WHERE symbol = ?", (symbol,)
+        ).fetchone()
+    return (row[0], row[1]) if row else None
 
 
 def get_all_waypoints(system: str, path: Path | str | None = None) -> list[dict[str, Any]]:

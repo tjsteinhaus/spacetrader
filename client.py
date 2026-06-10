@@ -56,7 +56,8 @@ def _handle_response(resp: requests.Response) -> dict:
 
 def _request_with_retry(method: str, path: str, *, params=None, json=None, token=None, retries=5) -> dict:
     delay = 5
-    for attempt in range(retries):
+    non_rate_limit_attempts = 0
+    while non_rate_limit_attempts < retries:
         try:
             resp = requests.request(
                 method,
@@ -68,13 +69,18 @@ def _request_with_retry(method: str, path: str, *, params=None, json=None, token
             )
             return _handle_response(resp)
         except SpaceTradersError as e:
-            if e.code == 429 and attempt < retries - 1:
+            if e.code == 429:
+                # _handle_response already slept for Retry-After; retry indefinitely
+                continue
+            non_rate_limit_attempts += 1
+            if non_rate_limit_attempts < retries:
                 time.sleep(delay)
                 delay = min(delay * 2, 60)
-                continue
-            raise
+            else:
+                raise
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt < retries - 1:
+            non_rate_limit_attempts += 1
+            if non_rate_limit_attempts < retries:
                 time.sleep(delay)
                 delay = min(delay * 2, 60)
             else:
@@ -83,6 +89,27 @@ def _request_with_retry(method: str, path: str, *, params=None, json=None, token
 
 def get(path: str, params: dict | None = None, token: str | None = None) -> dict:
     return _request_with_retry("GET", path, params=params, token=token)
+
+
+def get_raw(path: str, params: dict | None = None, token: str | None = None) -> dict:
+    """Like get() but returns the full response dict including 'meta' and 'data'."""
+    t = token or _get_token()
+    delay = 1
+    for attempt in range(10):
+        resp = requests.get(
+            f"{BASE_URL}{path}",
+            headers=_headers(t),
+            params=params,
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    resp.raise_for_status()
+    return resp.json()
 
 
 def post(path: str, body: dict | None = None, token: str | None = None) -> dict:
@@ -109,12 +136,11 @@ def get_all_pages(path: str, token: str | None = None) -> list:
     results = []
     page = 1
     while True:
-        data = get(path, params={"page": page, "limit": 20}, token=token)
-        items = data.get("data", data) if isinstance(data, dict) else data
+        raw = get_raw(path, params={"page": page, "limit": 20}, token=token)
+        items = raw.get("data", [])
         if isinstance(items, list):
             results.extend(items)
-            meta = data.get("meta", {}) if isinstance(data, dict) else {}
-            total = meta.get("total", len(items))
+            total = raw.get("meta", {}).get("total", len(results))
             if len(results) >= total:
                 break
             page += 1

@@ -31,7 +31,7 @@ from textual.binding import Binding
 from textual.screen import Screen, ModalScreen
 from textual.widgets import (
     Header, Footer, DataTable, Label, Static,
-    TabbedContent, TabPane, Button, Input,
+    TabbedContent, TabPane, Button, Input, Select,
 )
 from textual.containers import Container, Horizontal, Vertical
 from textual import work
@@ -43,23 +43,20 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
 import db
-import agent as agent_api
-import fleet as fleet_api
-import universe as universe_api
+import sync_api as agent_api
+import sync_api as fleet_api
+import sync_api as universe_api
 from client import SpaceTradersError
 
+# Derive SYSTEM from DB — v2 has no play.py global
 try:
-    from play import SYSTEM
+    with db._conn() as _c:
+        _row = _c.execute(
+            "SELECT system_symbol FROM waypoints WHERE system_symbol IS NOT NULL LIMIT 1"
+        ).fetchone()
+    SYSTEM = _row[0] if _row else "X1-GK27"
 except Exception:
-    # Derive system from DB waypoints so the dashboard works without importing play.py
-    try:
-        with db._conn() as _c:
-            _row = _c.execute(
-                "SELECT system_symbol FROM waypoints WHERE system_symbol IS NOT NULL LIMIT 1"
-            ).fetchone()
-        SYSTEM = _row[0] if _row else "X1-GK27"
-    except Exception:
-        SYSTEM = "X1-GK27"
+    SYSTEM = "X1-GK27"
 
 POLL_INTERVAL: float = 2.0  # seconds — overrideable via --interval CLI arg
 
@@ -1682,75 +1679,122 @@ class MapScreen(Screen):
 # Screen 9 — Settings
 # ---------------------------------------------------------------------------
 
+# All assignable roles (auto = derive from ship type)
+_ALL_ROLES = ["auto", "miner", "surveyor", "hauler", "trader", "explorer", "siphoner", "idle"]
+
+
 class SettingsScreen(Screen):
-    """Live bot control: toggle auto-buy and configure which ships to purchase."""
+    """Live bot control: toggle auto-buy and manage the full ship buy list."""
 
     BINDINGS = [("r", "action_refresh", "Refresh")]
+
+    # Track which row index is loaded in the edit form (-1 = new entry mode)
+    _editing_index: int = -1
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Label(
-            "Settings  •  Changes are picked up by the bot on its next loop — no restart needed",
+            "Settings  •  Changes take effect on the bot's next loop — no restart needed",
             classes="screen-hint",
         )
         with Vertical(id="settings-main"):
+
+            # ── Auto-buy toggle ───────────────────────────────────────────
             with Container(id="auto-buy-section"):
                 yield Label("[bold cyan]╔══ FLEET PURCHASING ══╗[/bold cyan]", classes="panel-title")
                 with Horizontal(id="auto-buy-row"):
                     yield Label("Auto-Buy Ships:  ")
                     yield Button("loading…", id="toggle-auto-buy", variant="default")
                     yield Label(
-                        "   When ON, bot buys ships from the list below after each contract completes",
+                        "   When ON, the bot buys ships from the list below after each contract",
                         classes="hint-text",
                     )
+
+            # ── Command ship role ─────────────────────────────────────────
             with Container(id="cmd-ship-section"):
                 yield Label("[bold cyan]╔══ COMMAND SHIP ROLE (Ship-2) ══╗[/bold cyan]", classes="panel-title")
                 with Horizontal(id="cmd-ship-row"):
                     yield Label("Ship-2 Role:  ")
-                    yield Button("loading…", id="btn-cmd-idle", variant="default")
+                    yield Button("loading…", id="btn-cmd-idle",   variant="default")
                     yield Button("loading…", id="btn-cmd-hauler", variant="default")
                     yield Label(
-                        "   Hauler: Ship-2 picks up cargo from miners at the asteroid and delivers it",
+                        "   Hauler: Ship-2 ferries ore from miners at the asteroid to the delivery WP",
                         classes="hint-text",
                     )
+
+            # ── Ship buy list ─────────────────────────────────────────────
             with Container(id="ship-list-section"):
                 yield Label("[bold cyan]╔══ SHIP BUY LIST ══╗[/bold cyan]", classes="panel-title")
                 yield Label(
-                    f"  Valid types: {', '.join(_BUYABLE_SHIP_TYPES)}",
+                    "  Click a row to edit it.  Leave role as 'auto' to let the bot decide.",
                     classes="hint-text",
                 )
                 yield DataTable(id="targets-table", cursor_type="row", zebra_stripes=True)
-                with Horizontal(id="add-row"):
-                    yield Input(
-                        placeholder="Ship type — e.g. SHIP_ORE_HOUND",
-                        id="add-type",
-                    )
-                    yield Input(
-                        placeholder="Max",
-                        id="add-max",
-                        restrict=r"\d*",
-                    )
-                    yield Button("Add / Update", id="btn-add", variant="primary")
-                    yield Button("Remove Selected", id="btn-remove", variant="error")
-                    yield Label("", id="add-msg")
+
+                # ── Edit / Add form ───────────────────────────────────────
+                with Container(id="edit-form"):
+                    yield Label("[bold]── Edit / Add entry ──[/bold]", classes="panel-title")
+                    with Horizontal(id="form-row-1"):
+                        yield Label("Ship type: ", classes="form-label")
+                        yield Select(
+                            [(t, t) for t in _BUYABLE_SHIP_TYPES],
+                            prompt="Select ship type",
+                            id="sel-type",
+                            allow_blank=True,
+                        )
+                        yield Label("  Role: ", classes="form-label")
+                        yield Select(
+                            [(r, r) for r in _ALL_ROLES],
+                            prompt="Select role",
+                            id="sel-role",
+                            allow_blank=False,
+                            value="auto",
+                        )
+                        yield Label("  Max to buy: ", classes="form-label")
+                        yield Input(
+                            placeholder="e.g. 3",
+                            id="inp-max",
+                            restrict=r"\d*",
+                        )
+                    with Horizontal(id="form-row-2"):
+                        yield Button("➕  Add New",        id="btn-add",    variant="primary")
+                        yield Button("💾  Save Changes",   id="btn-save",   variant="success")
+                        yield Button("🗑  Remove Selected", id="btn-remove", variant="error")
+                        yield Button("🧹  Clear All",       id="btn-clear",  variant="warning")
+                        yield Label("", id="form-msg")
+
         yield Label("", id="settings-status", classes="status-bar")
         yield Footer()
 
     def on_mount(self) -> None:
         t = self.query_one("#targets-table", DataTable)
-        t.add_columns("Ship Type", "Role", "Max Count")
+        t.add_columns("  #", "Ship Type", "Role", "Max")
         self._refresh()
+        self._set_form_mode_new()
+
+    # ------------------------------------------------------------------
+    # Table population
+    # ------------------------------------------------------------------
 
     def _refresh(self) -> None:
+        # Auto-buy toggle
         enabled = db.get_bot_setting("auto_buy_ships", "true").lower() == "true"
         btn = self.query_one("#toggle-auto-buy", Button)
-        if enabled:
-            btn.label = "✓  ENABLED"
-            btn.variant = "success"
-        else:
-            btn.label = "✗  DISABLED"
-            btn.variant = "error"
+        btn.label   = "✓  ENABLED"  if enabled else "✗  DISABLED"
+        btn.variant = "success"     if enabled else "error"
 
+        # Command ship role buttons
+        cmd_role   = db.get_bot_setting("command_ship_role", "idle")
+        idle_btn   = self.query_one("#btn-cmd-idle",   Button)
+        hauler_btn = self.query_one("#btn-cmd-hauler", Button)
+        if cmd_role == "hauler":
+            idle_btn.label,   idle_btn.variant   = "Idle",        "default"
+            hauler_btn.label, hauler_btn.variant = "✓  Hauler",   "success"
+        else:
+            idle_btn.label,   idle_btn.variant   = "✓  Idle",     "success"
+            hauler_btn.label, hauler_btn.variant = "Hauler",      "default"
+
+        # Ship buy list table
         raw = db.get_bot_setting("ship_buy_list", "[]")
         try:
             targets: list[dict] = json.loads(raw)
@@ -1761,37 +1805,103 @@ class SettingsScreen(Screen):
         t.clear()
         for i, entry in enumerate(targets):
             stype = entry.get("type", "?")
+            role  = entry.get("role", "auto")
+            maxc  = entry.get("max",  1)
+            role_style = {
+                "miner": "green", "surveyor": "magenta", "hauler": "blue",
+                "trader": "yellow", "explorer": "cyan", "siphoner": "cyan",
+                "idle": "dim", "auto": "white",
+            }.get(role, "white")
             t.add_row(
-                Text(stype, style="bold cyan"),
-                Text(_SHIP_ROLE.get(stype, "?"), style="yellow"),
-                Text(str(entry.get("max", 1)), style="bold green"),
+                Text(str(i + 1), style="dim"),
+                Text(stype,      style="bold cyan"),
+                Text(role,       style=role_style),
+                Text(str(maxc),  style="bold green"),
                 key=str(i),
-            )
-        if not targets:
-            t.add_row(
-                Text("No ships configured — bot uses hardcoded caps (2 miners, 1 surveyor)", style="dim"),
-                "", "",
             )
 
         self.query_one("#settings-status", Label).update(
             f"[dim]Updated: {datetime.now().strftime('%H:%M:%S')}  •  "
             + ("[green]Auto-buy ON[/green]" if enabled else "[red]Auto-buy OFF[/red]")
-            + f"  •  {len(targets)} ship target(s)[/dim]"
+            + f"  •  {len(targets)} entr{'y' if len(targets) == 1 else 'ies'} in buy list[/dim]"
         )
 
-        cmd_role = db.get_bot_setting("command_ship_role", "idle")
-        idle_btn   = self.query_one("#btn-cmd-idle",   Button)
-        hauler_btn = self.query_one("#btn-cmd-hauler", Button)
-        if cmd_role == "hauler":
-            idle_btn.label   = "Idle"
-            idle_btn.variant = "default"
-            hauler_btn.label   = "✓  Hauler"
-            hauler_btn.variant = "success"
-        else:
-            idle_btn.label   = "✓  Idle"
-            idle_btn.variant = "success"
-            hauler_btn.label   = "Hauler"
-            hauler_btn.variant = "default"
+    # ------------------------------------------------------------------
+    # Form helpers
+    # ------------------------------------------------------------------
+
+    def _set_form_mode_new(self) -> None:
+        """Clear the form for adding a brand-new entry."""
+        self._editing_index = -1
+        self.query_one("#sel-type", Select).value = Select.NULL
+        self.query_one("#sel-role", Select).value = "auto"
+        self.query_one("#inp-max",  Input).value  = ""
+        self.query_one("#btn-save", Button).disabled = True
+        self.query_one("#form-msg", Label).update("[dim]Fill in the fields above and click Add New[/dim]")
+
+    def _load_row_into_form(self, idx: int) -> None:
+        """Populate the edit form from the entry at list index idx."""
+        raw = db.get_bot_setting("ship_buy_list", "[]")
+        try:
+            targets = json.loads(raw)
+        except Exception:
+            return
+        if idx < 0 or idx >= len(targets):
+            return
+        entry = targets[idx]
+        self._editing_index = idx
+        stype = entry.get("type", "")
+        role  = entry.get("role", "auto")
+        maxc  = entry.get("max", 1)
+        if stype in _BUYABLE_SHIP_TYPES:
+            self.query_one("#sel-type", Select).value = stype
+        self.query_one("#sel-role", Select).value = role if role in _ALL_ROLES else "auto"
+        self.query_one("#inp-max",  Input).value  = str(maxc)
+        self.query_one("#btn-save", Button).disabled = False
+        self.query_one("#form-msg", Label).update(
+            f"[yellow]Editing row {idx + 1}: [bold]{stype}[/bold] — change fields then click Save Changes[/yellow]"
+        )
+
+    def _read_form(self) -> tuple[str, str, int] | None:
+        """Read and validate current form values. Returns (type, role, max) or None."""
+        msg = self.query_one("#form-msg", Label)
+        stype_val = self.query_one("#sel-type", Select).value
+        role_val  = self.query_one("#sel-role", Select).value
+        max_str   = self.query_one("#inp-max",  Input).value.strip()
+
+        if stype_val is Select.NULL or not stype_val:
+            msg.update("[red]Please select a ship type[/red]")
+            return None
+        if not max_str:
+            msg.update("[red]Max count is required[/red]")
+            return None
+        try:
+            max_count = int(max_str)
+            if max_count < 1:
+                raise ValueError
+        except ValueError:
+            msg.update("[red]Max must be a whole number ≥ 1[/red]")
+            return None
+
+        role = str(role_val) if role_val and role_val is not Select.NULL else "auto"
+        return str(stype_val), role, max_count
+
+    def _save_targets(self, targets: list[dict]) -> None:
+        db.set_bot_setting("ship_buy_list", json.dumps(targets))
+        self._refresh()
+
+    # ------------------------------------------------------------------
+    # Row click → populate form
+    # ------------------------------------------------------------------
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "targets-table":
+            return
+        self._load_row_into_form(event.cursor_row)
+
+    # ------------------------------------------------------------------
+    # Buttons
+    # ------------------------------------------------------------------
 
     @on(Button.Pressed, "#btn-cmd-idle")
     def _set_cmd_idle(self) -> None:
@@ -1811,56 +1921,72 @@ class SettingsScreen(Screen):
 
     @on(Button.Pressed, "#btn-add")
     def _add_ship(self) -> None:
-        stype   = self.query_one("#add-type", Input).value.strip().upper()
-        max_str = self.query_one("#add-max",  Input).value.strip()
-        msg_lbl = self.query_one("#add-msg",  Label)
-
-        if stype not in _BUYABLE_SHIP_TYPES:
-            msg_lbl.update(f"[red]Unknown type. Valid: {', '.join(_BUYABLE_SHIP_TYPES)}[/red]")
+        parsed = self._read_form()
+        if parsed is None:
             return
-        try:
-            max_count = int(max_str)
-            if max_count < 1:
-                raise ValueError
-        except ValueError:
-            msg_lbl.update("[red]Max must be a whole number ≥ 1[/red]")
-            return
-
+        stype, role, max_count = parsed
         raw = db.get_bot_setting("ship_buy_list", "[]")
         try:
             targets = json.loads(raw)
         except Exception:
             targets = []
+        targets.append({"type": stype, "role": role, "max": max_count})
+        self._save_targets(targets)
+        self.query_one("#form-msg", Label).update(
+            f"[green]Added {stype} (role={role}, max={max_count}) ✓[/green]"
+        )
+        self._set_form_mode_new()
 
-        existing = next((t for t in targets if t["type"] == stype), None)
-        if existing:
-            existing["max"] = max_count
-            msg_lbl.update("[green]Updated ✓[/green]")
-        else:
-            targets.append({"type": stype, "max": max_count})
-            msg_lbl.update("[green]Added ✓[/green]")
-
-        db.set_bot_setting("ship_buy_list", json.dumps(targets))
-        self.query_one("#add-type", Input).value = ""
-        self.query_one("#add-max",  Input).value = ""
-        self._refresh()
-
-    @on(Button.Pressed, "#btn-remove")
-    def _remove_ship(self) -> None:
-        t   = self.query_one("#targets-table", DataTable)
-        key = t.cursor_row_key
-        if key is None:
-            self.query_one("#add-msg", Label).update("[yellow]Select a row first[/yellow]")
+    @on(Button.Pressed, "#btn-save")
+    def _save_ship(self) -> None:
+        if self._editing_index < 0:
+            self.query_one("#form-msg", Label).update("[yellow]Click a row first to edit it[/yellow]")
             return
+        parsed = self._read_form()
+        if parsed is None:
+            return
+        stype, role, max_count = parsed
         raw = db.get_bot_setting("ship_buy_list", "[]")
         try:
             targets = json.loads(raw)
-            targets.pop(int(str(key.value)))
-            db.set_bot_setting("ship_buy_list", json.dumps(targets))
-            self.query_one("#add-msg", Label).update("[green]Removed ✓[/green]")
         except Exception:
-            pass
-        self._refresh()
+            targets = []
+        if self._editing_index >= len(targets):
+            self.query_one("#form-msg", Label).update("[red]Row no longer exists — try refreshing[/red]")
+            return
+        targets[self._editing_index] = {"type": stype, "role": role, "max": max_count}
+        self._save_targets(targets)
+        self.query_one("#form-msg", Label).update(
+            f"[green]Row {self._editing_index + 1} saved: {stype} (role={role}, max={max_count}) ✓[/green]"
+        )
+        self._editing_index = -1
+        self.query_one("#btn-save", Button).disabled = True
+
+    @on(Button.Pressed, "#btn-remove")
+    def _remove_ship(self) -> None:
+        t = self.query_one("#targets-table", DataTable)
+        rows = t.ordered_rows
+        if not rows or t.cursor_row >= len(rows):
+            self.query_one("#form-msg", Label).update("[yellow]Click a row to select it first[/yellow]")
+            return
+        idx = t.cursor_row
+        raw = db.get_bot_setting("ship_buy_list", "[]")
+        try:
+            targets = json.loads(raw)
+            removed = targets.pop(idx)
+            self._save_targets(targets)
+            self.query_one("#form-msg", Label).update(
+                f"[green]Removed {removed.get('type', '?')} ✓[/green]"
+            )
+            self._set_form_mode_new()
+        except Exception as e:
+            self.query_one("#form-msg", Label).update(f"[red]Error: {e}[/red]")
+
+    @on(Button.Pressed, "#btn-clear")
+    def _clear_all(self) -> None:
+        self._save_targets([])
+        self.query_one("#form-msg", Label).update("[green]Buy list cleared ✓[/green]")
+        self._set_form_mode_new()
 
     def action_refresh(self) -> None:
         self._refresh()
