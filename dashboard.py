@@ -1274,6 +1274,9 @@ class AnalyticsScreen(Screen):
         ct = self.query_one("#contracts-history-table", DataTable)
         ct.add_columns("Good", "Units", "Payout", "Advance", "Accepted", "Completed", "Duration", "Status")
 
+        rt = self.query_one("#runs-table", DataTable)
+        rt.add_columns("Time", "Ship", "Good", "Units", "Buy Cost", "Sell Rev", "Profit", "ROI%")
+
         self.refresh_data()
         self.set_interval(POLL_INTERVAL, self.refresh_data)
 
@@ -1301,6 +1304,8 @@ class AnalyticsScreen(Screen):
                 yield Static("", id="income-breakdown")
             with TabPane("Contracts"):
                 yield DataTable(id="contracts-history-table", cursor_type="row", zebra_stripes=True)
+            with TabPane("Trade Runs"):
+                yield DataTable(id="runs-table", cursor_type="row", zebra_stripes=True)
         yield Label("", id="analytics-status", classes="status-bar")
         yield Footer()
 
@@ -1357,8 +1362,28 @@ class AnalyticsScreen(Screen):
                        LIMIT 50"""
                 ).fetchall()
 
+                trade_runs = con.execute(
+                    """SELECT
+                           trip_id,
+                           ship_symbol,
+                           trade_symbol,
+                           SUM(CASE WHEN type='PURCHASE' THEN units      ELSE 0 END),
+                           SUM(CASE WHEN type='PURCHASE' THEN total_price ELSE 0 END),
+                           SUM(CASE WHEN type='SELL'     THEN total_price ELSE 0 END),
+                           MIN(CASE WHEN type='PURCHASE' THEN timestamp   END),
+                           MAX(CASE WHEN type='SELL'     THEN timestamp   END)
+                       FROM market_transactions
+                       WHERE trip_id IS NOT NULL
+                       GROUP BY trip_id
+                       ORDER BY COALESCE(
+                           MAX(CASE WHEN type='SELL' THEN timestamp END),
+                           MIN(timestamp)
+                       ) DESC
+                       LIMIT 100"""
+                ).fetchall()
+
             self.app.call_from_thread(
-                self._update, txns, y_20m, y_1h, y_all, income, contract_history
+                self._update, txns, y_20m, y_1h, y_all, income, contract_history, trade_runs
             )
         except Exception as e:
             self.app.call_from_thread(
@@ -1366,17 +1391,19 @@ class AnalyticsScreen(Screen):
                 f"[red]Error: {e}[/red]",
             )
 
-    def _update(self, txns, y_20m, y_1h, y_all, income, contract_history=None) -> None:
+    def _update(self, txns, y_20m, y_1h, y_all, income, contract_history=None, trade_runs=None) -> None:
         self._all_txns        = list(txns)
         self._yields_20m      = list(y_20m)
         self._yields_1h       = list(y_1h)
         self._yields_all      = list(y_all)
         self._income          = income
         self._contract_history = list(contract_history or [])
+        self._trade_runs       = list(trade_runs or [])
         self._update_txn_table()
         self._update_yields_table()
         self._update_income()
         self._update_contracts_history()
+        self._update_trade_runs()
         self.query_one("#analytics-status", Label).update(
             f"[dim]{len(txns)} transactions  •  "
             f"Updated: {datetime.now().strftime('%H:%M:%S')}[/dim]"
@@ -1521,6 +1548,56 @@ class AnalyticsScreen(Screen):
                 "",
                 "",
                 Text(f"Avg: {avg_str}", style="bold"),
+                "",
+            )
+
+    def _update_trade_runs(self) -> None:
+        rt = self.query_one("#runs-table", DataTable)
+        rt.clear()
+        rows = getattr(self, "_trade_runs", [])
+        if not rows:
+            rt.add_row("No trade runs yet", "", "", "", "", "", "", "")
+            return
+        total_profit = 0
+        for trip_id, ship, good, bought_units, buy_cost, sell_rev, buy_ts, sell_ts in rows:
+            profit = (sell_rev or 0) - (buy_cost or 0)
+            total_profit += profit
+            roi_pct = (profit / buy_cost * 100) if buy_cost and buy_cost > 0 else 0
+
+            # Timestamp: use sell time if complete, buy time if still open
+            ts = sell_ts or buy_ts
+            time_str = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M") if ts else "—"
+
+            profit_color = "green" if profit >= 0 else "red"
+            profit_sign  = "+" if profit >= 0 else ""
+
+            # If no sells yet, run is still in progress
+            if sell_rev is None or sell_rev == 0:
+                sell_str  = Text("in flight", style="dim cyan")
+                profit_str = Text("…", style="dim")
+                roi_str    = Text("…", style="dim")
+            else:
+                sell_str  = Text(f"{sell_rev:,}", style="green")
+                profit_str = Text(f"{profit_sign}{profit:,}", style=profit_color)
+                roi_str    = Text(f"{roi_pct:.1f}%", style=profit_color)
+
+            rt.add_row(
+                Text(time_str, style="dim"),
+                Text(ship  or "—", style="dim"),
+                Text(good  or "—", style="bold"),
+                str(bought_units or 0),
+                f"{buy_cost or 0:,}",
+                sell_str,
+                profit_str,
+                roi_str,
+            )
+        if rows:
+            rt.add_row(
+                Text("── totals ──", style="bold dim"),
+                "", "", "", "",
+                "",
+                Text(f"+{total_profit:,}" if total_profit >= 0 else f"{total_profit:,}",
+                     style="bold green" if total_profit >= 0 else "bold red"),
                 "",
             )
 

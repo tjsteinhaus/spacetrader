@@ -36,12 +36,12 @@ def navigate(symbol: str, waypoint_symbol: str) -> dict:
     return client.post(f"/my/ships/{symbol}/navigate", {"waypointSymbol": waypoint_symbol})
 
 
-def jump(symbol: str, waypoint_symbol: str) -> dict:
-    return client.post(f"/my/ships/{symbol}/jump", {"waypointSymbol": waypoint_symbol})
+def jump(symbol: str, system_symbol: str) -> dict:
+    return client.post(f"/my/ships/{symbol}/jump", {"systemSymbol": system_symbol})
 
 
-def warp(symbol: str, waypoint_symbol: str) -> dict:
-    return client.post(f"/my/ships/{symbol}/warp", {"waypointSymbol": waypoint_symbol})
+def warp(symbol: str, system_symbol: str) -> dict:
+    return client.post(f"/my/ships/{symbol}/warp", {"systemSymbol": system_symbol})
 
 
 def patch_nav(symbol: str, flight_mode: str) -> dict:

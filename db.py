@@ -180,7 +180,8 @@ CREATE TABLE IF NOT EXISTS market_transactions (
     units           INTEGER NOT NULL,
     price_per_unit  INTEGER NOT NULL,
     total_price     INTEGER NOT NULL,
-    timestamp       REAL NOT NULL
+    timestamp       REAL NOT NULL,
+    trip_id         TEXT             -- groups the BUY + SELL of a single trade run
 );
 
 CREATE INDEX IF NOT EXISTS idx_waypoints_system
@@ -197,6 +198,8 @@ CREATE INDEX IF NOT EXISTS idx_surveys_wp
     ON surveys(waypoint_symbol, expiration);
 CREATE INDEX IF NOT EXISTS idx_txn_timestamp
     ON market_transactions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_txn_trip
+    ON market_transactions(trip_id);
 
 CREATE TABLE IF NOT EXISTS extraction_yields (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +233,12 @@ CREATE TABLE IF NOT EXISTS bot_settings (
 def init_db(path: Path | str | None = None) -> None:
     """Create all tables and seed static deposit_goods data. Safe to call multiple times."""
     with _conn(path) as con:
+        # Pre-migrate trip_id before executescript creates the index on it
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "market_transactions" in tables:
+            txn_cols_pre = {r[1] for r in con.execute("PRAGMA table_info(market_transactions)").fetchall()}
+            if "trip_id" not in txn_cols_pre:
+                con.execute("ALTER TABLE market_transactions ADD COLUMN trip_id TEXT")
         con.executescript(_SCHEMA)
         # Migrate existing contracts table — add timing columns if absent
         existing = {r[1] for r in con.execute("PRAGMA table_info(contracts)").fetchall()}
@@ -490,16 +499,17 @@ def log_transaction(
     price_per_unit: int,
     total_price: int,
     path: Path | str | None = None,
+    trip_id: str | None = None,
 ) -> None:
     """Append a buy or sell transaction to market_transactions for later analysis."""
     with _conn(path) as con:
         con.execute(
             """INSERT INTO market_transactions
                (waypoint_symbol, ship_symbol, trade_symbol, type,
-                units, price_per_unit, total_price, timestamp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                units, price_per_unit, total_price, timestamp, trip_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (waypoint_symbol, ship_symbol, trade_symbol, txn_type,
-             units, price_per_unit, total_price, time.time()),
+             units, price_per_unit, total_price, time.time(), trip_id),
         )
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -309,8 +310,14 @@ def navigate_to(ship_symbol: str, destination: str) -> None:
     dest_system = _system_of(destination)
     curr_system = _system_of(ship["nav"]["waypointSymbol"])
     if dest_system != curr_system:
-        if has_jump_drive(ship):
-            # Navigate to local jump gate, then jump to destination system
+        if has_warp_drive(ship):
+            # Warp drive: travel directly without needing a jump gate (takes time, uses fuel)
+            ensure_orbit(ship_symbol)
+            ship_log(ship_symbol, f"[blue]🌀 warping → {dest_system}[/blue]")
+            fleet_api.warp(ship_symbol, dest_system)
+            wait_for_ship(ship_symbol)
+        else:
+            # Any ship can use a jump gate — navigate to it, then jump (instantaneous)
             gate_wp = _find_jump_gate(curr_system)
             if not gate_wp:
                 raise SpaceTradersError(0, f"No jump gate found in {curr_system}")
@@ -318,30 +325,28 @@ def navigate_to(ship_symbol: str, destination: str) -> None:
                 navigate_to(ship_symbol, gate_wp)  # intra-system leg to gate
             ensure_orbit(ship_symbol)
             ship_log(ship_symbol, f"[blue]⚡ jumping → {dest_system}[/blue]")
-            fleet_api.jump(ship_symbol, destination)
-            wait_for_ship(ship_symbol)
-            # If the jump landed us at a gate rather than the exact destination, navigate the rest
+            fleet_api.jump(ship_symbol, dest_system)
+            wait_cooldown(ship_symbol)  # jump is instant but triggers a cooldown
+            # Navigate the final leg within the new system if needed
             _after = fleet_api.get_ship(ship_symbol)["nav"]["waypointSymbol"]
             if _after != destination:
                 navigate_to(ship_symbol, destination)
-        elif has_warp_drive(ship):
-            ensure_orbit(ship_symbol)
-            ship_log(ship_symbol, f"[blue]🌀 warping → {destination}[/blue]")
-            fleet_api.warp(ship_symbol, destination)
-            wait_for_ship(ship_symbol)
-        else:
-            raise SpaceTradersError(
-                0,
-                f"{ship_symbol} has no jump/warp drive — cannot travel from {curr_system} to {dest_system}",
-            )
         return
 
     # ── Intra-system travel ───────────────────────────────────────────────────
     ensure_orbit(ship_symbol)
-    # Always navigate in CRUISE mode; reset if ship was left in DRIFT
-    if ship["nav"].get("flightMode", "CRUISE") != "CRUISE":
-        fleet_api.patch_nav(ship_symbol, "CRUISE")
-        ship_log(ship_symbol, f"[dim]reset to CRUISE mode[/dim]")
+    # Use BURN if ship has enough fuel for the 2x cost; otherwise CRUISE.
+    cur_fuel     = ship["fuel"].get("current", 0)
+    dist         = waypoint_distance(ship["nav"]["waypointSymbol"], destination)
+    burn_cost    = max(2, round(dist) * 2)
+    desired_mode = "BURN" if cur_fuel >= burn_cost else "CRUISE"
+    current_mode = ship["nav"].get("flightMode", "CRUISE")
+    if current_mode != desired_mode:
+        fleet_api.patch_nav(ship_symbol, desired_mode)
+        if desired_mode == "BURN":
+            ship_log(ship_symbol, f"[dim]🔥 BURN mode (dist={dist:.0f}, fuel={cur_fuel})[/dim]")
+        else:
+            ship_log(ship_symbol, f"[dim]reset to CRUISE mode[/dim]")
     ship_log(ship_symbol, f"[blue]🚀 Navigating → {destination}[/blue]")
     try:
         fleet_api.navigate(ship_symbol, destination)
@@ -2305,6 +2310,7 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
         good  = best["trade_symbol"]
         buy_wp  = best["buy_at"]
         sell_wp = best["sell_at"]
+        _trip_id = uuid.uuid4().hex[:8]  # groups BUY + SELL for this run
 
         # ── Pre-check: already have cargo → skip straight to sell ─────────────
         # Must happen BEFORE the credits check so a low-credit state doesn't
@@ -2355,7 +2361,7 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
                         _sell_remaining -= _this_sell
                         if _sell_remaining > 0:
                             ship_log(ship_symbol, f"[magenta]💰 sold {_this_sell}x {good} @ {_sell_price:,}/u | Credits: {ag.get('credits', 0):,}[/magenta]")
-                        db.log_transaction(sell_wp, ship_symbol, good, "SELL", _this_sell, _sell_price, tx.get("totalPrice", 0))
+                        db.log_transaction(sell_wp, ship_symbol, good, "SELL", _this_sell, _sell_price, tx.get("totalPrice", 0), trip_id=_trip_id)
                     except SpaceTradersError as e:
                         import re as _re
                         _lm = _re.search(r"limit of (\d+) units per transaction", str(e))
@@ -2470,7 +2476,7 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
                     f"| Credits: {ag.get('credits', 0):,}[/magenta]"
                 )
                 db.log_transaction(buy_wp, ship_symbol, good, "PURCHASE",
-                                   _this_batch, live_buy, tx.get("totalPrice", 0))
+                                   _this_batch, live_buy, tx.get("totalPrice", 0), trip_id=_trip_id)
             except SpaceTradersError as e:
                 err_str = str(e)
                 # Detect per-transaction limit error and retry with the limit as batch size
@@ -2547,7 +2553,7 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
                             f"| Credits: {ag.get('credits', 0):,}[/magenta]"
                         )
                     db.log_transaction(sell_wp, ship_symbol, good, "SELL",
-                                       _this_sell, _sell_price, tx.get("totalPrice", 0))
+                                       _this_sell, _sell_price, tx.get("totalPrice", 0), trip_id=_trip_id)
                 except SpaceTradersError as e:
                     err_str = str(e)
                     import re as _re
@@ -2585,6 +2591,7 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
                 _bh_aff   = max(0, (_bh_me["credits"] - TRADER_CREDIT_RESERVE) // _bh["buy_price"])
                 _bh_qty   = min(_bh_free, _bh_aff)
                 if _bh_qty >= 5:
+                    _bh_trip_id = uuid.uuid4().hex[:8]  # separate trip_id for backhaul leg
                     log(
                         f"[cyan]🔄 {ship_symbol}: backhaul {_bh['trade_symbol']} "
                         f"{sell_wp}→{_bh['sell_at']} "
@@ -2604,7 +2611,7 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
                             _bh_bought += _bh_this
                             _bh_remaining -= _bh_this
                             ship_log(ship_symbol, f"[magenta]🛒 bought {_bh_this}x {_bh['trade_symbol']} @ {_bh['buy_price']:,}/u | Credits: {ag.get('credits', 0):,}[/magenta]")
-                            db.log_transaction(sell_wp, ship_symbol, _bh["trade_symbol"], "PURCHASE", _bh_this, _bh["buy_price"], tx.get("totalPrice", 0))
+                            db.log_transaction(sell_wp, ship_symbol, _bh["trade_symbol"], "PURCHASE", _bh_this, _bh["buy_price"], tx.get("totalPrice", 0), trip_id=_bh_trip_id)
                         except SpaceTradersError as e:
                             import re as _re
                             _lm = _re.search(r"limit of (\d+) units per transaction", str(e))
@@ -2635,7 +2642,7 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
                                     _bh_sr -= _bh_st
                                     if _bh_sr > 0:
                                         ship_log(ship_symbol, f"[magenta]💰 sold {_bh_st}x {_bh['trade_symbol']} @ {_bh_sp:,}/u[/magenta]")
-                                    db.log_transaction(_bh["sell_at"], ship_symbol, _bh["trade_symbol"], "SELL", _bh_st, _bh_sp, tx.get("totalPrice", 0))
+                                    db.log_transaction(_bh["sell_at"], ship_symbol, _bh["trade_symbol"], "SELL", _bh_st, _bh_sp, tx.get("totalPrice", 0), trip_id=_bh_trip_id)
                                 except SpaceTradersError as e:
                                     import re as _re
                                     _lm = _re.search(r"limit of (\d+) units per transaction", str(e))
