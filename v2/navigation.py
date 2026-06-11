@@ -316,7 +316,9 @@ class Navigator:
                 await self.navigate_to(ship_symbol, destination)
                 return
 
-            # Find the best reachable fuel market that makes progress
+            # Find the best reachable fuel market that makes progress.
+            # Only consider markets where, after refueling to full, the
+            # destination is still within range (dead-end filter).
             fuel_markets = self._market.exporters("FUEL")
             markets = fuel_markets if fuel_markets else (self._market.known_markets or [self._cfg.asteroid_base])
             best_wp: str | None = None
@@ -346,15 +348,40 @@ class Navigator:
             if best_wp is None:
                 best_wp = local_wp
 
-            if best_wp is None:
-                log.warning("%s no reachable refuel market en route to %s — drifting", ship_symbol, destination)
-                await self.navigate_to(ship_symbol, destination)
-                return
+            if best_wp is not None:
+                log.debug("%s refuel hop → %s (en route to %s)", ship_symbol, best_wp, destination)
+                await self.navigate_to(ship_symbol, best_wp)
+                await self.ensure_docked(ship_symbol)
+                await self.refuel_if_needed(ship_symbol, threshold=100_000)
+                continue
 
-            log.debug("%s refuel hop → %s (en route to %s)", ship_symbol, best_wp, destination)
-            await self.navigate_to(ship_symbol, best_wp)
-            await self.ensure_docked(ship_symbol)
-            await self.refuel_if_needed(ship_symbol, threshold=100_000)
+            # No fuel market can bridge the gap — try a CRUISE hop to any
+            # waypoint that makes geometric progress before drifting the rest.
+            # CRUISE is ~3× faster than DRIFT so even one hop helps significantly.
+            best_cruise_wp: str | None = None
+            best_cruise_remaining = dist_to_dest
+            for wp, (wx, wy) in list(self._coords.items()):
+                if wp == cur_wp or wp in visited:
+                    continue
+                hop_dist = ((wx - cx) ** 2 + (wy - cy) ** 2) ** 0.5
+                if hop_dist > cur_fuel:
+                    continue  # can't reach in CRUISE with current fuel
+                remaining = ((dx - wx) ** 2 + (dy - wy) ** 2) ** 0.5
+                if remaining < best_cruise_remaining:
+                    best_cruise_remaining = remaining
+                    best_cruise_wp = wp
+
+            if best_cruise_wp:
+                log.debug(
+                    "%s cruise hop → %s (closing drift gap to %s)",
+                    ship_symbol, best_cruise_wp, destination,
+                )
+                await self.navigate_to(ship_symbol, best_cruise_wp)
+                continue  # re-evaluate from new position with updated fuel
+
+            log.warning("%s no reachable intermediate waypoint en route to %s — drifting", ship_symbol, destination)
+            await self.navigate_to(ship_symbol, destination)
+            return
 
         # Hop limit reached
         await self.navigate_to(ship_symbol, destination)

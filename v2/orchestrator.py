@@ -115,13 +115,13 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def _heartbeat(self) -> None:
-        """Logs every 10 s so we can see the event loop is alive."""
+        """Logs every 60 s so we can see the event loop is alive."""
         while True:
             try:
                 tasks = [t for t in asyncio.all_tasks() if not t.done()]
                 names = ", ".join(t.get_name() for t in tasks)
                 log.info("[HEARTBEAT] %d tasks running: %s", len(tasks), names)
-                await asyncio.sleep(10)
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 return
 
@@ -308,10 +308,10 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def _status_loop(self) -> None:
-        """Print a fleet status table every 5 minutes."""
-        INTERVAL = 300  # seconds
-        # Wait one interval before the first print so startup noise settles
-        await asyncio.sleep(INTERVAL)
+        """Print a fleet status table every 30 seconds."""
+        INTERVAL = 30  # seconds
+        # Short initial wait so startup noise settles first
+        await asyncio.sleep(5)
         while not self._stop.is_set():
             try:
                 await self._print_status_table()

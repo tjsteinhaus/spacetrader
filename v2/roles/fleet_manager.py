@@ -9,6 +9,7 @@ import logging
 
 from client import SpaceTradersError
 from api import fleet as fleet_api, agent as agent_api, universe as universe_api
+import db
 from constants import SHIP_SCORES, MINING_MOUNT_TIERS
 from .base import BaseRole
 
@@ -66,6 +67,9 @@ class FleetManagerRole(BaseRole):
             # 3. Buy new ships (if enabled)
             if self._cfg.auto_buy_enabled():
                 await self._buy_ships()
+
+            # 4. Scan the highest-priority stale market to keep arbitrage DB fresh
+            await self._scan_next_market()
 
             # Sleep between management cycles
             await asyncio.sleep(300)
@@ -209,6 +213,49 @@ class FleetManagerRole(BaseRole):
             except SpaceTradersError as e:
                 self.log.debug("Shipyard %s: %s", shipyard_wp, e)
 
+
+    async def _scan_next_market(self, staleness: float = 7_200.0) -> None:
+        """Navigate to the highest-priority stale/unvisited market and refresh live prices.
+
+        Priority: never-visited first, then most listings, then oldest data.
+        """
+        import time
+        with db._conn() as con:
+            rows = con.execute(
+                """
+                SELECT ml.waypoint_symbol,
+                       COUNT(*)                          AS listing_count,
+                       COALESCE(MAX(mp.last_updated), 0) AS newest_price
+                FROM   market_listings ml
+                LEFT JOIN market_prices mp
+                       ON ml.waypoint_symbol = mp.waypoint_symbol
+                WHERE  ml.waypoint_symbol LIKE ?
+                GROUP  BY ml.waypoint_symbol
+                HAVING newest_price < ?
+                ORDER  BY (newest_price = 0) DESC,
+                          listing_count DESC,
+                          newest_price ASC
+                LIMIT  1
+                """,
+                (f"{self._cfg.system}-%", time.time() - staleness),
+            ).fetchall()
+
+        if not rows:
+            return  # all markets are fresh
+
+        target_wp, listing_count, _ = rows[0]
+        self.log.info("Scanning market %s (%d listings)", target_wp, listing_count)
+        try:
+            await self._nav.navigate_with_refuel(self.ship_symbol, target_wp)
+            await self._nav.ensure_docked(self.ship_symbol)
+            prices = await self._market.get_prices(target_wp, force_refresh=True)
+            goods_count = len(prices)
+            if goods_count:
+                self.log.info("%s: %d goods priced", target_wp, goods_count)
+            else:
+                self.log.debug("%s: no live trade goods (listing-only market)", target_wp)
+        except SpaceTradersError as e:
+            self.log.warning("Market scan %s failed: %s", target_wp, e)
 
 def _best_mount_tier(ship: dict) -> int:
     symbols = {m.get("symbol", "") for m in ship.get("mounts", [])}

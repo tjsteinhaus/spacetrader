@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -17,6 +18,46 @@ _ENV_FILE = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=_ENV_FILE)
 
 BASE_URL = "https://api.spacetraders.io/v2/"
+
+# ---------------------------------------------------------------------------
+# Global rate limiter — SpaceTraders allows 2 req/s sustained, burst of 10.
+# We use a token-bucket that refills at 2 tokens/s and caps at 10 burst tokens.
+# All requests go through _rate_limit() before hitting the wire.
+# ---------------------------------------------------------------------------
+
+_RATE_TOKENS    = 10.0   # current bucket level (starts full)
+_RATE_CAPACITY  = 10.0   # max burst
+_RATE_REFILL    = 2.0    # tokens added per second
+_RATE_LAST_TS   = 0.0    # monotonic time of last refill
+_RATE_LOCK: asyncio.Lock | None = None  # created lazily inside the event loop
+
+
+def _get_rate_lock() -> asyncio.Lock:
+    global _RATE_LOCK
+    if _RATE_LOCK is None:
+        _RATE_LOCK = asyncio.Lock()
+    return _RATE_LOCK
+
+
+async def _rate_limit() -> None:
+    """Consume one token from the bucket, sleeping if the bucket is empty."""
+    global _RATE_TOKENS, _RATE_LAST_TS
+    lock = _get_rate_lock()
+    async with lock:
+        now = time.monotonic()
+        if _RATE_LAST_TS == 0.0:
+            _RATE_LAST_TS = now
+        elapsed = now - _RATE_LAST_TS
+        _RATE_TOKENS = min(_RATE_CAPACITY, _RATE_TOKENS + elapsed * _RATE_REFILL)
+        _RATE_LAST_TS = now
+
+        if _RATE_TOKENS < 1.0:
+            wait = (1.0 - _RATE_TOKENS) / _RATE_REFILL
+            await asyncio.sleep(wait)
+            _RATE_TOKENS = 0.0
+            _RATE_LAST_TS = time.monotonic()
+        else:
+            _RATE_TOKENS -= 1.0
 
 
 class SpaceTradersError(Exception):
@@ -135,6 +176,7 @@ class SpaceTradersClient:
         rate_limit_attempts = 0
         while non_rate_limit_attempts < retries:
             try:
+                await _rate_limit()
                 async with self._session.request(
                     method, path, params=params, json=json,
                 ) as resp:
@@ -144,7 +186,9 @@ class SpaceTradersClient:
                     rate_limit_attempts += 1
                     if rate_limit_attempts > 10:
                         raise  # stop hammering after 10 rate-limit hits
-                    continue  # _handle_response already slept
+                    # Back off proportionally to how many times we've been limited
+                    await asyncio.sleep(rate_limit_attempts * 0.5)
+                    continue
                 non_rate_limit_attempts += 1
                 if non_rate_limit_attempts < retries:
                     await asyncio.sleep(delay)
@@ -177,13 +221,19 @@ class SpaceTradersClient:
         assert self._session is not None, "Client not started — use async with"
         delay = 5
         non_rate_limit_attempts = 0
+        rate_limit_attempts = 0
         retries = 5
         while non_rate_limit_attempts < retries:
             try:
+                await _rate_limit()
                 async with self._session.request("GET", path, params=params) as resp:
                     return await self._handle_response_raw(resp)
             except SpaceTradersError as e:
                 if e.code == 429:
+                    rate_limit_attempts += 1
+                    if rate_limit_attempts > 10:
+                        raise
+                    await asyncio.sleep(rate_limit_attempts * 0.5)
                     continue
                 non_rate_limit_attempts += 1
                 if non_rate_limit_attempts < retries:

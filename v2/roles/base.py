@@ -130,6 +130,8 @@ class BaseRole(ABC):
 
         ship = await self._get_ship()
         sell_wp = ship["nav"]["waypointSymbol"]
+        # Force-refresh prices at the actual sell market to catch crashed/changed markets
+        await self._market.get_prices(sell_wp, force_refresh=True)
         import db
         for item in ship["cargo"].get("inventory", []):
             if keep_good and item["symbol"] == keep_good:

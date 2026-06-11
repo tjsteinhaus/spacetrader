@@ -22,7 +22,6 @@ from .base import BaseRole
 
 # Trading constants
 TRADER_MIN_MARGIN     = 150
-TRADER_MIN_ROI        = 0.10
 TRADER_CREDIT_RESERVE = 150_000   # keep this much in reserve for mining/repair ops
 TRADER_MIN_UNITS      = 5
 PRICE_FLOOR_RATIO     = 0.10   # stop selling if price drops below 10% of first batch
@@ -111,20 +110,13 @@ class TraderRole(BaseRole):
 
         # ── Find best arbitrage opportunity ──
         opps = db.get_arbitrage_opportunities(self._cfg.system, min_margin=TRADER_MIN_MARGIN)
-        opps = [
-            o for o in opps
-            if o["buy_price"] > 0
-            and (o["sell_price"] - o["buy_price"]) / o["buy_price"] >= TRADER_MIN_ROI
-        ]
+        opps = [o for o in opps if o["buy_price"] > 0]
         if not opps:
-            self.log.info("No arbitrage opportunities in DB — scanning all markets now")
-            await self._market.scan_good_sources()
+            self.log.info("No arbitrage opportunities in DB — refreshing all market prices now")
+            for wp in self._market.known_markets or []:
+                await self._market.get_prices(wp, force_refresh=True)
             opps = db.get_arbitrage_opportunities(self._cfg.system, min_margin=TRADER_MIN_MARGIN)
-            opps = [
-                o for o in opps
-                if o["buy_price"] > 0
-                and (o["sell_price"] - o["buy_price"]) / o["buy_price"] >= TRADER_MIN_ROI
-            ]
+            opps = [o for o in opps if o["buy_price"] > 0]
         if not opps:
             self.log.info("Still no arbitrage opportunities after scan — waiting 5min")
             await asyncio.sleep(300)
@@ -160,7 +152,7 @@ class TraderRole(BaseRole):
 
         live_margin = live_sell - live_buy
         live_roi    = live_margin / live_buy if live_buy > 0 else 0
-        if live_margin < TRADER_MIN_MARGIN or live_roi < TRADER_MIN_ROI:
+        if live_margin < TRADER_MIN_MARGIN:
             self.log.warning(
                 "Margin shrank at %s: %d/u margin (%.0f%% ROI) — re-scanning",
                 buy_wp, live_margin, live_roi * 100,
