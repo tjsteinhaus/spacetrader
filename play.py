@@ -452,8 +452,8 @@ def navigate_with_refuel(ship_symbol: str, destination: str) -> None:
             if hop_dist > cur_fuel:
                 continue  # can't reach this hop with current fuel
             remaining = ((dx - wx) ** 2 + (dy - wy) ** 2) ** 0.5
-            if remaining > fuel_cap:
-                continue  # even at full tank from this hop, destination is out of range — dead end
+            if remaining >= dist_to_dest:
+                continue  # no progress toward destination
             if remaining < best_remaining:
                 best_remaining = remaining
                 best_wp = wp
@@ -464,6 +464,7 @@ def navigate_with_refuel(ship_symbol: str, destination: str) -> None:
             # drifting. CRUISE is much faster than DRIFT, so even one hop helps.
             best_cruise_wp: str | None = None
             best_cruise_remaining = dist_to_dest
+            fuel_market_set = set(_good_exporters.get("FUEL", []))
             for wp, (wx, wy) in list(_wp_coords.items()):
                 if wp == cur_wp:
                     continue
@@ -471,6 +472,12 @@ def navigate_with_refuel(ship_symbol: str, destination: str) -> None:
                 if hop_dist > cur_fuel:
                     continue  # can't reach in CRUISE with current fuel
                 remaining = ((dx - wx) ** 2 + (dy - wy) ** 2) ** 0.5
+                # Only use this waypoint as a cruise hop if it's a fuel market
+                # OR the destination is reachable directly from here at full tank.
+                # Hopping to a non-fuel waypoint that still can't reach the destination
+                # just shifts where we drift from without saving any time.
+                if wp not in fuel_market_set and remaining > fuel_cap:
+                    continue
                 if remaining < best_cruise_remaining:
                     best_cruise_remaining = remaining
                     best_cruise_wp = wp
@@ -790,6 +797,7 @@ def choose_mining_target(ship_symbol: str, contract: dict) -> str:
     Called at miner thread startup — naturally re-evaluated on every new contract.
     Falls back to the global ASTEROID if the scored cache is empty.
     """
+    global _active_mining_wp, ASTEROID
     d           = contract["terms"]["deliver"][0]
     good        = d["tradeSymbol"]
     delivery_wp = d["destinationSymbol"]
@@ -849,8 +857,16 @@ def choose_mining_target(ship_symbol: str, contract: dict) -> str:
 
     best = scored[0][1]["symbol"]
     ship_log(ship_symbol, f"[cyan]→ mining at [bold]{best}[/bold][/cyan]")
-    global _active_mining_wp
     _active_mining_wp = best  # surveyor follows the lead miner's chosen asteroid
+    if best != ASTEROID:
+        # Persist the better choice so future restarts start at the right asteroid
+        try:
+            agent = agent_api.get_my_agent()
+            db.save_agent_config(agent["symbol"], {"ASTEROID": best})
+            ASTEROID = best
+            log(f"[cyan]Updated ASTEROID to {best} in DB[/cyan]")
+        except Exception:
+            pass
     return best
 
 
@@ -3185,6 +3201,36 @@ def _bg_scan_next_market() -> None:
     if not rows:
         return  # all markets are fresh
 
+    # Skip wandering for market scans when we can't afford any ship — stay parked.
+    if _shipyard_price_cache:
+        current_ships = fleet_api.get_my_ships()
+        current_miners    = len([s for s in current_ships if has_mining_mount(s)])
+        current_surveyors = len([s for s in current_ships if has_survey_mount(s) and not has_mining_mount(s)])
+        current_haulers   = len([
+            s for s in current_ships
+            if s["registration"]["role"] in ("HAULER", "TRANSPORT")
+            and s["symbol"] != FLEET_MANAGER_SHIP
+        ])
+        def _scan_should_buy(stype: str) -> bool:
+            score = ship_score(stype, current_miners, current_surveyors, current_haulers)
+            return score >= 0
+        _KNOWN_SHIP_TYPES = [
+            "SHIP_ORE_HOUND", "SHIP_MINING_DRONE", "SHIP_COMMAND_FRIGATE",
+            "SHIP_SURVEYOR", "SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER",
+        ]
+        _eligible = set(t for t in _KNOWN_SHIP_TYPES if _scan_should_buy(t))
+        if _eligible:
+            me = agent_api.get_my_agent()
+            credits = me.get("credits", 0)
+            _min_price = min(
+                (s["purchasePrice"] for ships in _shipyard_price_cache.values()
+                 for s in ships if s.get("type") in _eligible),
+                default=None,
+            )
+            if _min_price is not None and credits - _min_price < CREDIT_RESERVE:
+                log("[dim]Fleet manager: can't afford next ship — skipping market scan[/dim]")
+                return
+
     target_wp, listing_count, _ = rows[0]
     log(f"[dim]🔍 Fleet manager scanning market {target_wp} ({listing_count} listings)…[/dim]")
     try:
@@ -3945,9 +3991,9 @@ def get_next_contract() -> dict | None:
         log("[yellow]No pending contracts — negotiating a new one...[/yellow]")
 
     try:
-        navigate_to(COMMAND_SHIP, _FACTION_HQ_WP)
-        ensure_docked(COMMAND_SHIP)
-        result = fleet_api.negotiate_contract(COMMAND_SHIP)
+        navigate_to(FLEET_MANAGER_SHIP, _FACTION_HQ_WP)
+        ensure_docked(FLEET_MANAGER_SHIP)
+        result = fleet_api.negotiate_contract(FLEET_MANAGER_SHIP)
         new_contract = result.get("contract", {})
         payout = _contract_payout(new_contract)
         good = _contract_good(new_contract)

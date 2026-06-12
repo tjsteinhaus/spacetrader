@@ -1,6 +1,7 @@
 # SpaceTraders Automation Playbook
 
-**Agent:** TYLERMASTERY  
+**Current Agent:** TYLERDEVRUN (system X1-BX78, post-June 2026 reset)  
+**Previous Agent:** TYLERMASTERY (system X1-HU91, same codebase)  
 **Script:** `play.py`  
 **Game:** SpaceTraders v2 API — https://spacetraders.io  
 **Purpose:** Automate mining contracts indefinitely to accumulate credits competitively.
@@ -24,6 +25,10 @@
     - [Contract Sourcing](#contract-sourcing)
     - [Miner Loop](#miner-loop)
     - [Surveyor Loop](#surveyor-loop)
+    - [Hauler Loop](#hauler-loop)
+    - [Siphon Loop](#siphon-loop)
+    - [Trader Loop](#trader-loop)
+    - [Explorer Loop](#explorer-loop)
     - [Fleet Manager](#fleet-manager)
     - [Sell Junk \& Jettison Logic](#sell-junk--jettison-logic)
     - [Market Intelligence](#market-intelligence)
@@ -35,7 +40,7 @@
     - [Weighted Contract Selection (`_contract_score`)](#weighted-contract-selection-_contract_score)
     - [Distance-Adjusted Sell Routing (`best_sell_market_for_cargo`)](#distance-adjusted-sell-routing-best_sell_market_for_cargo)
     - [Dynamic Ship Buy Priority (`ship_score`)](#dynamic-ship-buy-priority-ship_score)
-    - [Deferred: Surveyor Targeting (Item 4)](#deferred-surveyor-targeting-item-4)
+    - [Deferred → Implemented: Surveyor Targeting](#deferred--implemented-surveyor-targeting)
     - [Deferred: Buy/Sell Waypoint Net Revenue (Item 5)](#deferred-buysell-waypoint-net-revenue-item-5)
   - [Decision Log](#decision-log)
   - [Rebuild Plan](#rebuild-plan)
@@ -79,11 +84,14 @@ blocking each other.
 Main Thread (run())
 │
 ├── work_contract(contract)
-│   ├── Thread: miner_loop(TYLERMASTERY-1)
-│   ├── Thread: miner_loop(TYLERMASTERY-3)
-│   ├── Thread: miner_loop(TYLERMASTERY-5)
-│   ├── Thread: surveyor_loop(TYLERMASTERY-4)
-│   └── Thread: fleet_manager_loop(TYLERMASTERY-2)
+│   ├── Thread: miner_loop(TYLERDEVRUN-1)        ← 400 fuel cap; mines + delivers
+│   ├── Thread: miner_loop(TYLERDEVRUN-X)        ← each additional miner ship
+│   ├── Thread: hauler_loop(TYLERDEVRUN-X)       ← parks at asteroid, accepts transfers, delivers
+│   ├── Thread: surveyor_loop(TYLERDEVRUN-X)     ← surveys at active mining asteroid
+│   ├── Thread: siphon_loop(TYLERDEVRUN-X)       ← siphons gas giants passively
+│   ├── Thread: trader_loop(TYLERDEVRUN-X)       ← buys low / sells high (arbitrage)
+│   ├── Thread: explorer_loop(TYLERDEVRUN-X)     ← jumps to nearby systems, scans markets
+│   └── Thread: fleet_manager_loop(TYLERDEVRUN-2)
 │       ├── Every 120s: _bg_buy_and_launch() — buys ships, spins new threads
 │       └── Every 600s: _bg_negotiate_contract() — pre-negotiates next contract
 │
@@ -104,6 +112,11 @@ when the contract is fulfilled. `stop_event` signals an orderly shutdown.
 - `_fulfill_lock` — prevents two miners from both calling `fulfill_contract` at once
 - `_manager_lock` — prevents overlapping fleet-management ops
 - `_market_cache` — dict of market prices, keyed by waypoint; refreshed every 10 min
+- `_active_mining_wp` — set by `choose_mining_target` on the lead miner; surveyors follow this
+- `_hauler_symbols` — registered hauler ship symbols; miners offload cargo to haulers at the asteroid
+- `_siphoner_symbols` — registered siphon drone symbols
+- `_trader_symbols` — registered trader ship symbols
+- `_explorer_symbols` — registered explorer ship symbols
 
 ---
 
@@ -115,107 +128,107 @@ All tunable constants live at the top of `play.py`. Change these before a new ru
 
 | Constant | Value | What It Is |
 |---|---|---|
-| `SYSTEM` | `X1-HU91` | The star system we're operating in |
-| `ASTEROID` | `X1-HU91-FD5D` | ENGINEERED_ASTEROID with COMMON_METAL_DEPOSITS + on-site FUEL exchange |
-| `ASTEROID_BASE` | `X1-HU91-H52` | Nearest full market to the asteroid; MARKETPLACE + SHIPYARD |
-| `SHIPYARD_WP` | `X1-HU91-H52` | Same moon — used for repairs and upgrades |
-| `SHIPYARD_WPS` | `[H52, A2]` | All known shipyards; fleet manager checks both when buying ships |
+| `SYSTEM` | `X1-BX78` | Current star system (post-reset) |
+| `ASTEROID` | `X1-BX78-B42` | COMMON_METAL_DEPOSITS; 122 units from B7; chosen by `choose_mining_target` for IRON_ORE |
+| `ASTEROID_BASE` | `X1-BX78-B7` | Nearest full market/shipyard to the asteroid |
+| `SHIPYARD_WP` | `X1-BX78-A2` | Primary shipyard (at faction HQ) |
+| `SHIPYARD_WPS` | `[A2, C45, H56]` | All known shipyards; fleet manager checks all when buying |
+| `FACTION_HQ_WP` | `X1-BX78-A1` | Faction HQ — negotiate contracts here |
 
-**Why X1-HU91-FD5D?** A full system scan (85 waypoints) revealed FD5D is an
-ENGINEERED_ASTEROID at the center cluster (-2, 26). Key advantages over B8 (old
-site at +350 units away):
-- K84 (contract delivery) is only 127 units from FD5D vs 408 units from B8 — 3× closer
-- FD5D has an on-site FUEL exchange (no need to leave for basic refueling)
-- H52 is 38 units away (MARKETPLACE + SHIPYARD) vs B7 at 195 units
-- ENGINEERED_ASTEROIDs yield a wider range of goods including refined metals
+**Legacy (X1-HU91 / TYLERMASTERY):**
+- `ASTEROID` was `X1-HU91-FD5D` (ENGINEERED_ASTEROID with on-site fuel)
+- `ASTEROID_BASE` was `X1-HU91-H52` (38 units from FD5D)
+- See Decision Log for why those specific choices were made
 
-B8 (old site) was COMMON_METAL_DEPOSITS and yielded only ALUMINUM_ORE, never
-refined ALUMINUM — contracts for ALUMINUM were impossible to complete from B8.
+**Why X1-BX78-B42?** System scan found B42 (COMMON_METAL_DEPOSITS) at 122 units from B7 — well within the 400 fuel cap. The first-run `auto_configure` wrongly saved J86 (DEEP_CRATERS + PRECIOUS_METAL_DEPOSITS, 610 units from B7), which caused all miners to DRIFT. B42 was dynamically selected by `choose_mining_target` once the asteroid cache populated, and has been persisted to DB. See Decision Log for full details.
 
 ### Ships
 
 | Constant | Value | What It Is |
 |---|---|---|
-| `COMMAND_SHIP` | `TYLERMASTERY-1` | The first ship; always a miner if it has a mining laser |
-| `FLEET_MANAGER_SHIP` | `TYLERMASTERY-2` | No mining laser; used for background fleet ops |
+| `COMMAND_SHIP` | `TYLERDEVRUN-1` | Primary miner (400 fuel cap, mining laser) |
+| `FLEET_MANAGER_SHIP` | `TYLERDEVRUN-2` | No mining laser; background fleet ops, contract negotiation |
 
-**Why TYLERMASTERY-2 as fleet manager?** It was the second ship acquired and has no
-mining laser, so assigning it to mining would waste it. Instead it stays near the
-shipyard to buy new ships immediately when credits allow, and navigates to the faction
-HQ to pre-negotiate contracts.
+**Current fleet (X1-BX78):**
+- `TYLERDEVRUN-1` — miner, 400 fuel cap; at B7 / mining B42
+- `TYLERDEVRUN-2` — fleet manager, 400 fuel cap; patrols shipyards + faction HQ
+- `TYLERDEVRUN-3` — surveyor, 80 fuel cap; at B42
+- `TYLERDEVRUN-4` — surveyor, 80 fuel cap; at B42
+
+**Note on surveyors:** 80-unit fuel cap surveyors can still reach B42 (122 units from B7) but only barely — they DRIFT if the tank starts below the trip distance. Initial transit from B7 may drift; once at B42 they stay and survey in place.
+
+**Legacy (X1-HU91 / TYLERMASTERY):**
+- `COMMAND_SHIP` was `TYLERMASTERY-1`
+- `FLEET_MANAGER_SHIP` was `TYLERMASTERY-2`
+
+**Why FLEET_MANAGER_SHIP as fleet manager?** It has no mining laser, so assigning it to mining would waste it. Instead it stays near the shipyard to buy new ships immediately when credits allow, and navigates to the faction HQ to pre-negotiate contracts.
 
 ### Economics
 
 | Constant | Value | Rationale |
 |---|---|---|
-| `CREDIT_RESERVE` | `30_000` | Never spend below this floor — keeps us solvent for fuel + repairs |
+| `CREDIT_RESERVE` | `50_000` | Never spend below this floor — keeps us solvent for fuel, repairs, and emergency buys |
 | `MIN_SELL_PRICE` | `30` | cr/unit threshold below which cargo is jettisoned, not hauled |
-| `MIN_FUEL_CAPACITY` | `200` | Ships with tiny tanks can't reach FD5D↔H52↔K84 reliably |
-| `MIN_BUY_CREDITS` | `120_000` | Fleet manager won't even navigate to the shipyard below this — prevents constant fruitless trips when credits are low |
-| `SELL_ROUTING_DIST_COST` | `20` | cr per distance unit used when comparing remote sell markets. A round trip costs `distance × 2 × 20` cr. Keeps miners from chasing a 500 cr premium that costs 3,000 cr in travel. |
+| `NO_DRIFT_DIST_MAX` | `70` | Max distance (units) from a fuel market for small-tank ships (MINING_DRONE, SIPHON_DRONE) to operate safely without drifting |
+| `MIN_BUY_CREDITS` | `100_000` | Fleet manager starts buying once we clear this threshold |
+| `SELL_ROUTING_DIST_COST` | `20` | cr per distance unit deducted from remote-market revenue. A round trip costs `distance × 2 × 20` cr. Prevents chasing premiums that don't offset fuel + time. |
+| `CHEAP_BUY_THRESHOLD` | `200` | cr/unit — buy a mineable good from the market instead of mining if its purchase price is ≤ this (e.g. trivially cheap ore) |
+| `DRY_EXTRACT_THRESHOLD` | `5` | Consecutive extractions yielding zero of the contract good before the miner escalates to buy mode early |
+| `MIN_CONTRACT_PAYOUT` | `30_000` | Skip unaccepted contracts with onFulfilled < this and try to negotiate a better one |
 
-**Why 30k reserve?** At 30k we can still afford: fuel for all ships (~400 cr each
-fill), emergency repairs, and at least partial contract delivery. At 50k (the old
-value) we blocked ship purchases because SURVEYOR costs 32,918 cr — we'd need 82,918
-credits just to buy the cheapest useful ship.
+**Why 50k reserve?** Ensures we can afford emergency repairs, fuel for the full fleet, and still have slack for price spikes. This is higher than the old 30k value because we now run more ship roles (haulers, traders, explorers) simultaneously, all of which need credits to operate.
 
 **Why MIN_SELL_PRICE = 30?** ICE_WATER sells for 13 cr/unit and QUARTZ_SAND for 18
-cr/unit. A round-trip from asteroid FD5D to market H52 takes ~4 minutes. Mining 10
-units of ICE_WATER earns 130 cr but costs fuel and time that could be spent mining
-metals (worth 400-600 cr per load). Jettisoning at the asteroid recovers cargo space
-immediately and lets the miner stay productive.
+cr/unit. Hauling low-value goods wastes a miner's time or a hauler's cargo run that could carry contract goods worth 400-600 cr per load. Jettisoning at the asteroid recovers cargo space immediately.
 
-**Why MIN_BUY_CREDITS = 120,000?** The fleet manager used to navigate to the shipyard
-every 2 minutes regardless of credits, wasting fuel and API calls. At 120k we can
-afford the cheapest useful ship (SHIP_LIGHT_SHUTTLE ~86k at A2) and still have the
-30k reserve. Below that, the manager parks at A1 idle.
+**Why MIN_BUY_CREDITS = 100,000?** At 100k we can afford a SURVEYOR (~33k) or a LIGHT_HAULER (~50-80k) and still have the 50k reserve. The fleet manager parks at the faction HQ until credits clear this threshold to avoid fruitless shipyard trips.
+
+**Why NO_DRIFT_DIST_MAX instead of MIN_FUEL_CAPACITY?** Small-tank ships (80-unit MINING_DRONE, SIPHON_DRONE) are safe to buy if the asteroid or gas giant is within ~70 units of a fuel market — they can refuel without drifting. A blanket 200-unit fuel capacity filter blocked these cheap ships even when the route was trivial.
 
 ### Ship Purchase Priority
 
 Ship scoring is **dynamic** — `ship_score(type, miners, surveyors, haulers)` adjusts each
-ship's value based on current fleet composition rather than using static numbers.
+ship's value based on current fleet composition. The **Week 2 strategy** prioritises
+infrastructure (surveyor + haulers) before raw extraction capacity.
 
 ```python
-# Base scores (before fleet-composition adjustments)
+# Base scores — Week 2 ordering (higher = buy first; -1 = never buy)
 SHIP_SCORES = {
-    "SHIP_ORE_HOUND":       100,  # Best miner: powerful mounts + large cargo
-    "SHIP_MINING_DRONE":    90,   # Decent miner
-    "SHIP_SURVEYOR":        75,   # Fills survey pool — boosts all miners' copper yield
-    "SHIP_HEAVY_FREIGHTER": 65,   # Good hauler once fleet is large
-    "SHIP_LIGHT_HAULER":    60,   # Useful with 2+ miners
-    "SHIP_COMMAND_FRIGATE": 50,   # Versatile but expensive
-    "SHIP_PROBE":           -1,   # Never buy — no laser, no surveyor, useless
+    "SHIP_SURVEYOR":        100,  # First buy — boosts all miners immediately
+    "SHIP_LIGHT_HAULER":     95,  # Buy all 3 before anything else (big gap enforces order)
+    "SHIP_ORE_HOUND":        65,  # Best miner — only after all 3 haulers purchased
+    "SHIP_MINING_DRONE":     60,  # Cheap miner — no-drift check required
+    "SHIP_SIPHON_DRONE":     55,  # Passive gas — no-drift check required
+    "SHIP_HEAVY_FREIGHTER":  -1,  # Never buy
+    "SHIP_COMMAND_FRIGATE":  -1,  # Already have one
+    "SHIP_GAS_DRONE":        -1,  # Never buy
+    "SHIP_LIGHT_SHUTTLE":    -1,  # Never buy — tiny cargo, wrong role
+    "SHIP_PROBE":            -1,  # Never buy
 }
 ```
 
-**Dynamic rules applied on top of base scores:**
+**Dynamic gate rules applied on top of base scores:**
 
-| Condition | Effect |
-|---|---|
-| Fewer than 2 miners | Surveyor returns −1 (don't buy before you can mine) |
-| Already have 1+ surveyor | Surveyor returns −1 (one is enough) |
-| Fewer than 2 miners | Hauler returns −1 (nothing to haul yet) |
-| Already have 1+ hauler | Hauler returns −1 (one is enough for now) |
-| 3+ miners | Hauler gets `base + (miners − 2) × 15` bonus — delivery trips waste more miner-time as fleet grows |
-| 5+ miners | Miner score drops by 30 — diminishing returns on raw extraction |
+| Ship Type | Gate Condition | Effect |
+|---|---|---|
+| `SHIP_SURVEYOR` | surveyors ≥ 1 | → −1 (one surveyor is enough) |
+| `SHIP_LIGHT_HAULER` | haulers ≥ 3 | → −1 (fleet is fully staffed for hauling) |
+| `SHIP_ORE_HOUND` | haulers < 3 | → −1 (must fill all 3 hauler slots first) |
+| `SHIP_ORE_HOUND` | miners ≥ 8 | → `max(base − 30, 10)` (diminishing returns) |
+| `SHIP_MINING_DRONE` | haulers < 3 | → −1 (same: haulers first) |
+| `SHIP_MINING_DRONE` | asteroid too far from fuel market (`_is_mining_drone_safe()`) | → −1 (would DRIFT constantly) |
+| `SHIP_MINING_DRONE` | miners ≥ 8 | → `max(base − 30, 10)` |
+| `SHIP_SIPHON_DRONE` | haulers < 3 | → −1 |
+| `SHIP_SIPHON_DRONE` | siphoners ≥ 2 | → −1 |
+| `SHIP_SIPHON_DRONE` | gas giant too far from fuel market (`_is_siphon_reachable()`) | → −1 |
 
-**Example at 4 miners, 0 surveyors, 0 haulers:**
-- ORE_HOUND: 100 (best miner)
-- MINING_DRONE: 90
-- LIGHT_HAULER: 60 + (4−2)×15 = **90** (matches drone — delivery ROI is high)
-- SURVEYOR: −1 (blocked: already have 1)
-- Effective priority: ORE_HOUND → tie between DRONE/HAULER based on price
+**No-drift gate (`NO_DRIFT_DIST_MAX = 70`):** `_is_mining_drone_safe()` checks the distance from `ASTEROID` to the nearest fuel market. If > 70 units, small-tank drones would need to DRIFT to refuel — rejecting the purchase until the asteroid routing changes.
 
-**Why SHIP_SURVEYOR at 75?** Surveyors generate surveys that target specific
-resources. Without surveys, extraction is random — you might mine 20 QUARTZ_SAND
-cycles in a row and zero COPPER_ORE. With a copper-focused survey, the odds shift
-dramatically toward the contract resource. One surveyor can fuel all miners with
-better results. Previously set to -1 (never buy), which meant we never got copper.
+**Why surveyor first (score 100)?** A single surveyor running continuously keeps the shared survey pool full so all 3+ miners get focused surveys. Without it, extraction is random — 20+ consecutive cycles with zero contract good is not unusual on the wrong deposit.
 
-**Why was SHIP_SURVEYOR originally -1?** The first pass of the script treated
-surveyors as dead weight because they have no mining laser. This was wrong — their
-value is indirect but significant: better surveys → more copper per cycle → faster
-contract completion.
+**Why 3 haulers before more miners (score 95)?** Each miner that leaves the asteroid for a delivery run is a miner not mining. With 3 dedicated haulers, all miners stay at the asteroid continuously. The haulers absorb all cargo transfers via `fleet_api.transfer_cargo()`. At fleet size 4–5 miners, 3 haulers is the sweet spot — more haulers are idle, fewer means miners still deliver.
+
+**Buy-list DB override:** The dashboard can set `ship_buy_list` in the bot_settings DB table to override the hardcoded SHIP_SCORES. Format: `[{"type": "SHIP_SURVEYOR", "max": 1}, ...]`. Empty list = use hardcoded defaults.
 
 ### Repair & Upgrades
 
@@ -305,72 +318,60 @@ Each miner runs this loop independently:
 
 ```
 0. Choose mining target: choose_mining_target(ship_symbol, contract)
-1. Preflight: navigate to ASTEROID_BASE for fuel if far away or tank < 50%
-2. Navigate to mining_target, enter orbit
-3. Get a survey from the shared pool (or survey independently if at non-default asteroid)
-4. Loop:
-   a. Check fuel — top up if < 40%
-   b. Check condition — repair if < 80%
-   c. If cargo nearly full (< 5 free slots):
-      - If carrying contract good: navigate to delivery waypoint, deliver
+1. Preflight fuel check:
+   - Small-tank ships (≤80 fuel): always top up to 100% before heading out
+   - Normal ships: refuel at ASTEROID_BASE if fuel < 90% AND not already at asteroid
+2. Preflight delivery shortcut: if ship already carries enough contract goods, deliver now
+3. Decide mine vs buy:
+   - Non-mineable goods (not in MINEABLE_GOODS) → direct buy path
+   - Goods where no scanned asteroid has the matching deposit trait → buy path
+   - Goods with market price ≤ CHEAP_BUY_THRESHOLD (200 cr/u) → buy path (trivially cheap)
+   - Otherwise: navigate to mining_target and begin mining
+4. Mining inner loop:
+   a. If haula ship is at asteroid and cargo full → transfer entire cargo to hauler, continue mining
+   b. Check fuel — top up if < 60% (small tanks) or < 40% (normal ships), but only when not at asteroid
+   c. Check condition — repair at shipyard if < 80%
+   d. If cargo nearly full (< 5 free slots) OR have contract good while not at asteroid:
+      - If contract good in cargo: navigate to delivery waypoint, deliver
         - If delivery completes contract: fulfill_contract, set contract_done, exit
-      - Else: dump junk, return to mine
-   d. Wait for cooldown
-   e. Extract (with survey if available, else raw)
-   f. Repeat
+      - Else: sell junk, reset _empty_loads counter, optionally buy from market
+   e. Wait for cooldown
+   f. Extract with survey (from shared pool if at default asteroid) or raw extract
+   g. Track _dry_extractions — escalate to buy mode after DRY_EXTRACT_THRESHOLD (5) consecutive misses
+   h. Repeat
 ```
 
-**Mining target selection (`choose_mining_target`):** Before navigating anywhere, each
-miner calls `choose_mining_target()` to find the optimal asteroid for the current
-contract. It scores all known asteroids and returns the best one. See the
-[Weighted Mining Target](#weighted-mining-target-choose_mining_target) section for
-the full scoring formula.
+**Stationary mining with haulers:** When a hauler is registered at the asteroid
+(`_hauler_symbols` non-empty), miners check for an available hauler using
+`_get_available_hauler(mining_target)` when their cargo fills. If found, they call
+`fleet_api.transfer_cargo()` to offload everything to the hauler, then immediately
+continue mining without leaving the asteroid. This eliminates miner delivery trips.
 
-**Shared survey pool guard:** Surveys are tied to a specific asteroid. If a miner is
-routed to a non-default asteroid, it uses `try_survey()` instead of the shared pool
-(which contains surveys for the default `ASTEROID`). This prevents miners from
-wasting survey attempts on the wrong location.
+**Small-tank preflight logic:** Ships with ≤ 80-unit fuel caps (`_small_tank = True`)
+must start fully fuelled — they can't reach the delivery waypoint or repair yard from
+the asteroid on a partial tank. The threshold is 100% for small tanks vs. 90% for
+normal ships.
 
-**The delivery detour:** Before the long trip to the delivery destination, the miner
-always stops at ASTEROID_BASE (H52) to refuel. This ensures it never runs out of fuel
-mid-delivery. After delivery it refuels again at the nearest market before returning.
+**Direct buy mode (`_direct_buy`):** If the contract good physically cannot drop from
+any scanned asteroid (checked via `db.can_be_mined(good, SYSTEM)`), or if it's not in
+`MINEABLE_GOODS`, the miner skips the asteroid entirely and goes straight to the
+exporter market. On low credits it falls back to mining junk goods for income, then
+retries the buy.
 
-**Preflight fuel check:** At startup, ships only navigate to H52 for a preflight
-refuel if they are *not* already at the mining cluster AND have less than 50% fuel.
-Using `and` (not `or`) prevents ships at FD5D from making unnecessary refuel trips.
+**`_dry_extractions` counter:** Each extraction that yields zero of the contract good
+increments this counter. After `DRY_EXTRACT_THRESHOLD` (5) consecutive misses, the
+miner escalates to buy mode early — treating the situation the same as 3 empty cargo
+loads. Resets when the contract good is found.
 
-**Survey fallback:** If the shared survey pool is empty, the miner calls `try_survey()`
-itself. This is slower (uses its own cooldown) but keeps it from mining blindly while
-waiting for the surveyor to arrive.
-
-**`contract_done` event:** The first miner to deliver the final units calls
+**`contract_done` event:** The first miner (or hauler) to deliver the final units calls
 `fulfill_contract()` under a `_fulfill_lock`. It then sets `contract_done`. All other
 miners and the fleet manager see this event and exit their loops.
 
-**Buy-from-market fallback (`_empty_loads`):** Some contract goods (e.g. ALUMINUM)
-never drop from asteroid mining — only the ore variant (ALUMINUM_ORE) does. Refined
-metals must be purchased from a market. The miner tracks consecutive full cargo loads
-with zero contract good using `_empty_loads`. After 2 such loads it switches to the
-buy path:
-
-```
-1. Check _good_exporters for a market that sells the contract good
-2. Navigate to that market (best_buy_waypoint)
-3. Bust the market cache (force fresh API call while docked)
-4. Read purchase price from cache
-5. Buy as many units as: min(free_cargo, affordable_with_reserve)
-6. Navigate to delivery waypoint and deliver
-7. Reset _empty_loads = 0, continue mining
-```
-
-**Why bust the cache before buying?** `best_sell_waypoint` is called for all 29 markets
-while the ship is at H52 (not H51). Without a ship at H51, the API returns empty
-`tradeGoods`, which would zero out the H51 cache. By calling
-`_market_cache_ts.pop(_buy_wp, None)` before `get_market_prices(_buy_wp)`, we force
-a fresh API call while the ship is actually docked — guaranteeing real prices.
-
-In X1-HU91, ALUMINUM is bought from **H51** at ~159 cr/unit (exports it). H51 is at
-(36, 27) — same location as H52, ~15s hop.
+**Buy-from-market fallback (`_empty_loads`):** After 3 full cargo loads with zero
+contract good (or after `DRY_EXTRACT_THRESHOLD` dry extractions), the miner switches to
+the buy path. It uses `best_buy_waypoint(good)` to find the cheapest exporter and buys
+as many units as `min(free_cargo, affordable_with_reserve)`. Trade volume limits are
+respected: a `4604` error causes the batch size to halve and retry.
 
 ---
 
@@ -401,6 +402,143 @@ miners benefit simultaneously.
 **Shared survey pool:** Surveys in SpaceTraders are "consumable" by the game server —
 each use can deplete it. The code tracks expiration timestamps and prunes expired
 surveys automatically. Miners pick the survey with the most copper hits from the pool.
+
+---
+
+### Hauler Loop
+
+```python
+def hauler_loop(ship_symbol, contract, contract_done, stop_event):
+```
+
+Dedicated to cargo pickup, delivery, and junk selling — miners never leave the asteroid.
+
+```
+1. Preflight: refuel at ASTEROID_BASE, navigate to ASTEROID, enter orbit
+2. Loop:
+   a. Accept cargo transfers from stationary miners (miners call fleet_api.transfer_cargo)
+   b. Departure decision — depart when any of:
+      - cargo ≥ 50% full (HAULER_DEPART_FRACTION = 0.50)
+      - have ≥ 30 units of the contract good
+      - have any cargo AND no new transfers for 5 minutes (HAULER_MAX_WAIT_SECS = 300)
+   c. Refuel at ASTEROID_BASE
+   d. If carrying contract good: navigate to delivery waypoint, deliver
+      - If contract complete: fulfill_contract, set contract_done, exit
+   e. sell_junk() for remaining non-contract cargo (routes to best market)
+   f. Return to ASTEROID_BASE to refuel, then back to ASTEROID
+```
+
+**Why haulers are more efficient than mining delivery trips:** When a miner makes a
+delivery round-trip (asteroid → base → delivery → base → asteroid), it's offline for
+the entire trip — typically 10–30 min depending on delivery distance. A dedicated
+hauler absorbs all those trips while all miners stay at the asteroid extracting 100%
+of the time. With 3 haulers and 4+ miners, the effective throughput gain is equivalent
+to adding ~1–2 free miners.
+
+**Cargo transfer at the asteroid:** Miners check `_get_available_hauler(mining_target)`:
+a hauler orbiting the same waypoint with ≥ 10 cargo slots free. If found, the miner
+calls `fleet_api.transfer_cargo()` to offload everything, then continues mining.
+
+---
+
+### Siphon Loop
+
+```python
+def siphon_loop(ship_symbol, stop_event):
+```
+
+Passive income from gas giants — no contract needed.
+
+```
+1. Find all gas giants in the system (from DB, type = GAS_GIANT)
+2. Pick the gas giant closest to ASTEROID_BASE
+3. Navigate to it (via navigate_with_refuel)
+4. Loop:
+   a. Wait cooldown
+   b. siphon() — yields HYDROCARBON, LIQUID_HYDROGEN, LIQUID_NITROGEN, etc.
+   c. When cargo full: sell at best market, return to gas giant
+```
+
+**Gate check (`_is_siphon_reachable()`):** Fleet manager only buys a SIPHON_DRONE if
+at least one gas giant is within `NO_DRIFT_DIST_MAX` (70 units) of a fuel market. Gas
+giants often sit near system centre, far from any market, which would strand small
+ships. The gate enforces safety before purchase.
+
+---
+
+### Trader Loop
+
+```python
+def trader_loop(ship_symbol, stop_event):
+```
+
+Arbitrage: buy low at one market, sell high at another.
+
+**Constants:**
+| Constant | Value | Meaning |
+|---|---|---|
+| `TRADER_MIN_MARGIN` | `150 cr/unit` | Skip opportunities below this buy-sell spread |
+| `TRADER_MIN_ROI` | `10%` | Minimum return on investment per trip |
+| `TRADER_CREDIT_RESERVE` | `150_000 cr` | Don't spend below this floor when buying cargo |
+
+```
+1. Load arbitrage opportunities from DB (db.get_arbitrage_opportunities)
+2. Filter out the active contract good (let hauler handle it uncontested)
+3. If viable opportunities exist:
+   a. Check live buy price at source market (cache bust while docked)
+   b. Verify margin still ≥ TRADER_MIN_MARGIN after seeing real price
+   c. Re-score in case a better route appeared since the cache refreshed
+   d. Buy up to min(cargo_capacity, affordable) units in batches
+   e. Pre-sell check at destination: wait up to 2×5min if market is depressed
+   f. Sell in batches; stop early if price crashes to <10% of opening price
+   g. Backhaul: if the sell waypoint also has a good buy opportunity, buy before
+      the empty return trip (eliminates dead-leg travel cost)
+4. If no viable opportunities: scout a stale market instead of sitting idle
+   - Picks the market with the oldest or missing price data
+   - Navigates there, docks, force-refreshes prices
+   - Skips unresponsive markets for 2 hours (_scout_skip)
+5. Wait 5 minutes between scans if no arbitrage or scouting available
+```
+
+**Backhaul logic:** After selling, the trader checks if the destination market has
+goods that can be profitably bought and sold elsewhere. If margin ≥ `TRADER_MIN_MARGIN`
+and ROI ≥ `TRADER_MIN_ROI`, it loads up and sells at the backhaul destination before
+returning home. This turns every round-trip into a two-leg profit opportunity.
+
+**Price crash guard:** During batch sells, if the current price drops to <10% of the
+first batch's price (market absorption), the trader stops selling and dumps remaining
+stock via `sell_junk()` to avoid a total loss.
+
+**Trip ID logging:** Each buy→sell (and backhaul) run gets a UUID-prefixed `trip_id`
+logged in the DB transactions table so profit-per-trip can be reconstructed in analytics.
+
+---
+
+### Explorer Loop
+
+```python
+def explorer_loop(ship_symbol, stop_event):
+```
+
+Scans nearby systems for price intelligence and contract opportunities.
+
+```
+1. Navigate to jump gate in home system
+2. Call fleet_api.scan_systems() to discover nearby reachable systems
+3. For each system (closest first, up to 5):
+   a. Jump to that system's jump gate
+   b. Call fleet_api.scan_waypoints() to find markets
+   c. For up to 3 markets: get_market() to retrieve export/import/exchange data
+   d. Log any ore prices significantly higher than home system (EXPLORER_PRICE_BOOST = 1.30)
+   e. Update shared market cache + DB for hauler routing decisions
+4. After sweeping all nearby systems: rest EXPLORER_REST_SECS (600s = 10 min)
+5. Repeat, resetting visited set
+```
+
+**Why explore?** Remote system markets sometimes pay 30-100% more for refined metals
+or ores than the home system. An explorer that identifies these opportunities allows
+the hauler to route deliveries there for a significant credit bonus. The explorer also
+finds arbitrage price pairs that the trader can exploit across systems.
 
 ---
 
@@ -626,18 +764,31 @@ mining_target = choose_mining_target(ship_symbol, contract)
 Called once at miner thread startup. Scores every known asteroid in the cache and
 returns the waypoint symbol of the best one for this miner and contract.
 
-**Scoring formula per asteroid:**
+**Scoring formula per asteroid (`score_asteroid_for_miner`):**
 
 ```
-score = trait_score                          # base quality of the asteroid's deposits
-      + 80   (if deposit trait matches contract good)
-      + 20   (if round_trip ≤ 50% of fuel capacity)
-      - 10   (if round_trip > 75% of fuel capacity)
-      - 80   (if round_trip > fuel capacity — unreachable without multi-hop)
-      + 15   (if ship is already within 100 units)
-      - 10   (if ship is more than 300 units away)
-      + 10   (if asteroid is within 100 units of the delivery waypoint)
-      - 10   (if asteroid is more than 300 units from the delivery waypoint)
+score = trait_score                          # sum of _ASTEROID_TRAIT_SCORES for all traits
+
+# Resource match (highest-weight factor)
++ 80.0  if deposit trait for contract good is present on this asteroid
+
+# Fuel efficiency: round_trip = base_dist × 2 / fuel_capacity (ratio)
++ 20.0  if ratio ≤ 1.0  (fits in one tank — very efficient)
+- 10.0  if ratio ≤ 2.0  (one refuel stop each way)
+- 35.0  if ratio ≤ 4.0  (two+ refuel stops — costly for small ships)
+- 80.0  if ratio  > 4.0  (extremely far; major inefficiency)
+
+# First-trip drift penalty (new):
+- 60.0  if (dist_from_ship + base_dist) > fuel_cap
+         (ship can't cruise to asteroid AND return to base on current fuel — will drift)
+
+# Distance from ship's current position (initial travel cost)
++ 15.0  if dist_from_ship < 50 units (already nearby)
+- 10.0  if dist_from_ship > 200 units (expensive first trip)
+
+# Delivery proximity (minor — asteroid closer to delivery WP = shorter hauler trips)
++ 10.0  if dist_to_delivery_wp < 100 units
+- 10.0  if dist_to_delivery_wp > 500 units
 ```
 
 **Deposit trait scores (`_ASTEROID_TRAIT_SCORES`):**
@@ -645,11 +796,16 @@ score = trait_score                          # base quality of the asteroid's de
 | Trait | Score | Why |
 |---|---|---|
 | `PRECIOUS_METAL_DEPOSITS` | 50 | Gold, platinum — highest contract value |
+| `RARE_METAL_DEPOSITS` | 40 | Uncommon but valuable |
 | `COMMON_METAL_DEPOSITS` | 20 | Iron, copper — most contract goods |
-| `RARE_METAL_DEPOSITS` | 30 | Uncommon but valuable |
+| `DEEP_CRATERS` | 15 | Modifies other traits — higher extraction yield |
 | `MINERAL_DEPOSITS` | 10 | Quartz, silicon — rarely contracted |
-| `DEEP_CRATERS` | +25 bonus | Modifies any other trait — higher extraction yield |
-| `STRIPPED` | −9999 | Exhausted asteroid — never go here |
+| `HOLLOWED_INTERIOR` | 5 | Minor quality boost |
+| `EXPLOSIVE_GASES` | −5 | Mostly gas products, low ore yield |
+| `DEBRIS_CLUSTER` | −5 | Poor deposit quality |
+| `UNSTABLE_COMPOSITION` | −5 | Poor deposit quality |
+| `RADIOACTIVE` | −10 | Very poor ore content |
+| `STRIPPED` | −9999 | Exhausted — never go here |
 
 **Resource-to-deposit mapping (`GOOD_TO_DEPOSIT_TRAITS`):**
 
@@ -664,16 +820,22 @@ GOOD_TO_DEPOSIT_TRAITS = {
 ```
 
 **Fuel efficiency factor:** Mining drones have only 80-unit fuel tanks. An asteroid
-245 units away requires 123 fuel for a round trip — that's a multi-hop that adds 5+
-minutes per delivery cycle. The fuel efficiency penalty makes far asteroids much less
-attractive for small ships.
+245 units away requires 490 fuel for a round trip — far beyond one tank. The fuel
+ratio tiers impose escalating penalties: one refuel stop (ratio ≤ 2.0) only costs -10
+points, but two+ stops (ratio ≤ 4.0) cost -35, and extremely far asteroids cost -80.
+The **first-trip drift penalty** (-60) is the most important for small ships: if the
+ship can't even cruise *to* the asteroid and back on a full tank, it will be forced
+to drift the return leg — adding 20–55 minutes per cycle.
 
-**Top 3 logging:** `choose_mining_target` logs the top 3 scored asteroids with scores,
-deposit match status, and fuel distance so you can see exactly why a particular
+**Top 3 logging:** `choose_mining_target` logs the top 3 scored asteroids with their
+scores, deposit match status, and base distance so you can see exactly why a particular
 asteroid was chosen.
 
-**Fallback:** If the cache is empty or the contract good is not mineable (e.g. must be
-purchased), falls back to the global `ASTEROID` constant.
+**Persistence:** The winner is written back to the `agent_config` DB table so restarts
+use the same asteroid without re-running the scoring.
+
+**Fallback:** If the cache is empty or the contract good is not mineable, falls back to
+the global `ASTEROID` constant.
 
 ---
 
@@ -688,14 +850,26 @@ hours grinding a contract worth 20% less.
 
 ```python
 def _contract_score(contract) -> float:
-    base = payout / units_remaining          # cr per unit to deliver
+    payout_per_unit = payout / units_remaining   # cr per unit to deliver
+
     if any asteroid has matching deposit trait:
-        base *= 1.20                          # +20%: we can mine this efficiently
+        payout_per_unit *= 1.20                  # +20%: we can mine this efficiently
+
     if good is not mineable:
-        base *= 0.85                          # -15%: must buy from market, adds overhead
-    base -= delivery_distance * 0.3          # penalty for far delivery waypoint
-    return base
+        payout_per_unit *= 0.85                  # −15%: must buy from market, adds overhead
+
+    payout_per_unit -= delivery_distance * 0.3   # penalty for far delivery waypoint
+
+    return payout_per_unit
 ```
+
+**`get_next_contract()` priority order:**
+
+1. **Already-accepted contracts** — we're committed; pick highest payout among them
+2. **High-value unaccepted contracts** (onFulfilled ≥ `MIN_CONTRACT_PAYOUT = 30,000 cr`), ranked by `_contract_score`
+3. **Negotiate a fresh contract** at the faction HQ — trying for a better one
+4. **Fall back** to the best-scoring unaccepted contract even if below MIN_CONTRACT_PAYOUT
+5. Accept whatever was negotiated if nothing else is available
 
 **Why payout-per-unit instead of raw payout?** A 200,000 cr contract for 500 units is
 worse than a 120,000 cr contract for 100 units — the first takes 5× longer to
@@ -708,6 +882,10 @@ match, miners would be at the wrong asteroid and get zero of the needed good.
 **Non-mineable penalty (−15%):** Some goods (ALUMINUM, refined metals) never drop
 from asteroids — only the ore variant does. Contracts for non-mineable goods require
 the buy-from-market fallback path, which adds latency and credit risk.
+
+**MIN_CONTRACT_PAYOUT gate:** Contracts paying < 30,000 cr on fulfillment are skipped
+in favour of negotiating a better one. The script will attempt to negotiate, then fall
+back if the negotiated contract is also below threshold.
 
 **`_log_contract_scores()`:** When 2+ unaccepted contracts are available, logs a
 formatted table showing each contract's good, units remaining, payout, deposit match
@@ -725,23 +903,28 @@ cost — a net loss of 15,400 cr.
 **How it works:**
 
 ```
-net_value(market) = Σ(price × units for each cargo item at that market)
+# Cluster markets (≤5 units from ASTEROID_BASE) get ZERO travel penalty —
+# we're going there to refuel anyway. e.g. H51 and H53 at the same coordinates as H52.
+cluster_val = max revenue among all co-located cluster markets
+
+# Remote markets: must sell FUEL and beat the cluster on net value
+net_value(market) = Σ(price × units for each cargo item)
                   − round_trip_distance × 2 × SELL_ROUTING_DIST_COST
+
+# Winner: highest net_value beats cluster_val
 ```
 
 `SELL_ROUTING_DIST_COST = 20` cr/unit (tunable constant in `play.py`).
 
-A remote market only wins if its `net_value` exceeds the base cluster's raw revenue.
-The base cluster pays zero travel cost (it's always the refuel stop anyway).
+**Candidate filtering:** Only markets known to import or exchange our cargo goods are
+scored — not all 27 markets. This avoids API calls for markets that clearly won't buy.
 
 **Safety guard:** Only routes to remote markets that stock FUEL. A market 300 units
 away with no fuel would leave the miner stranded after selling.
 
 **Log output when rerouting:**
 ```
-[TYLERMASTERY-3] Selling at X1-KU6-F58 (net 4,820 cr vs base 3,100 cr)
-  GOLD_ORE: 340 × 12 units = 4,080 cr | travel cost: 246 × 2 × 20 = 9,840 cr
-  → Net: -5,760 cr  [BASE WINS]
+Sell routing: X1-BX78-K87 net 4,820 cr (raw 14,660 − 9,840 travel cost) vs cluster 3,100 cr
 ```
 
 **Why `SELL_ROUTING_DIST_COST = 20`?** A fuel fill at a market costs roughly 100-400
@@ -754,64 +937,47 @@ clearly justifies the detour.
 
 ### Dynamic Ship Buy Priority (`ship_score`)
 
-**Problem before:** Ship purchase priority was a static lookup table. The same scores
-applied whether you had 1 miner or 6. This meant the script might keep buying miners
-(score 90) even when having a hauler (score 60) would provide much more value — a
-fleet of 5 miners without a hauler means every delivery trip is still done by a miner,
-wasting extraction time.
+**Problem before:** Ship purchase priority was a static lookup table and the "dynamic"
+rules were based on miner/hauler counts in the old way. The new Week2 strategy flips
+the priority entirely: surveyor and haulers come first, miners come last.
 
 **How it works:**
 
 ```python
-def ship_score(ship_type, miners, surveyors=0, haulers=0) -> int:
+def ship_score(ship_type, current_miner_count, current_surveyor_count, current_hauler_count) -> int:
 ```
 
-Returns the base score for `ship_type`, then applies composition-based adjustments:
+See the [Ship Purchase Priority](#ship-purchase-priority) section for the full base
+scores and gate rules. Summary:
 
-| Rule | Adjustment |
-|---|---|
-| Miners < 2 | Surveyor → −1 (never buy before you have miners) |
-| Surveyors ≥ 1 | Surveyor → −1 (one is plenty) |
-| Miners < 2 | Hauler → −1 (nothing to haul) |
-| Haulers ≥ 1 | Hauler → −1 (one covers all delivery needs) |
-| Miners ≥ 3 | Hauler gets +`(miners − 2) × 15` bonus |
-| Miners ≥ 5 | Any miner gets −30 penalty |
+| Phase | What to buy | Why |
+|---|---|---|
+| 0 miners, 0 surveyors | SURVEYOR first | Boosts miners immediately — biggest single ROI |
+| 0 haulers | LIGHT_HAULER × 3 | Lock miners to asteroid, eliminate delivery trips |
+| 3 haulers, 0 miners | ORE_HOUND or MINING_DRONE | Now miners can stay at asteroid; haulers do all travel |
+| 3 haulers, n miners | SIPHON_DRONE (if gas giant reachable) | Passive income; no contract needed |
 
-**Hauler value growth example:**
-
-| Miners | Hauler score formula | Result | Best miner score |
-|---|---|---|---|
-| 2 | −1 (blocked) | −1 | 100 |
-| 3 | 60 + (3−2)×15 | 75 | 100 |
-| 4 | 60 + (4−2)×15 | 90 | 100 |
-| 5 | 60 + (5−2)×15 | 105 | 70 (−30 penalty) |
-
-At 5 miners the hauler beats another miner for the first time, making it the top
-priority purchase.
-
-**Why does hauler value grow with miner count?** Each miner that goes on a delivery
-trip is a miner not mining. With 5 miners and no hauler, on average 1-2 miners are
-always in transit for delivery. A dedicated hauler lets all 5 mine continuously,
-effectively adding ~1-2 mining ship equivalents of throughput for much less than the
-cost of 2 new mining ships.
+**No-drift gates:**
+- `_is_mining_drone_safe()`: checks `waypoint_distance(ASTEROID, nearest_fuel_market) ≤ NO_DRIFT_DIST_MAX (70)`
+- `_is_siphon_reachable()`: same check for any gas giant in the system
 
 ---
 
-### Deferred: Surveyor Targeting (Item 4)
+### Deferred → Implemented: Surveyor Targeting
 
-**What:** The surveyor always navigates to the global `ASTEROID` constant, regardless
-of where the miners have been routed. If miners are sent to `X1-KU6-B49`
-(PRECIOUS_METAL_DEPOSITS) but the surveyor is at `X1-KU6-B9` (COMMON_METAL_DEPOSITS),
-the surveys are useless — miners are at the wrong asteroid to consume them.
+**What:** The surveyor originally always navigated to the global `ASTEROID` constant,
+regardless of where miners were routed. This is now **partially implemented**.
 
-**Planned fix:** On each surveyor loop iteration, determine which asteroid has the
-most active miners assigned to it (via `choose_mining_target` records), navigate
-there, and survey that asteroid instead.
+**Current behaviour:** At each iteration of the surveyor loop, the surveyor reads
+`_active_mining_wp` (set by `choose_mining_target` on the lead miner) and
+repositions to that asteroid if it has changed. The surveyor also validates it can
+physically reach the target on one tank before committing (falls back to `ASTEROID`
+if the target has no fuel market within range).
 
-**Why deferred:** This only matters when `choose_mining_target` routes miners away
-from the default `ASTEROID`. In the current system (X1-KU6), the default asteroid is
-the best one for most contract goods, so the surveyor is usually correct anyway. Once
-fleet size grows and miners routinely split across asteroids, this becomes high value.
+**Remaining gap:** If miners are split across multiple asteroids (future fleet
+expansion), the surveyor still follows only the single lead miner's target. Full
+multi-miner consensus tracking (follow the asteroid with the most miners) is not yet
+implemented.
 
 **TODO location:** `surveyor_loop()` docstring in `play.py`.
 
@@ -834,6 +1000,62 @@ knowing the ship's current location at query time, which adds complexity.
 
 **TODO location:** `best_sell_waypoint()` and `best_buy_waypoint()` docstrings in
 `play.py`.
+
+---
+
+## Current Reset: TYLERDEVRUN / X1-BX78
+
+### System Layout
+
+| Waypoint | Type | x | y | Notes |
+|---|---|---|---|---|
+| X1-BX78-B7 | ASTEROID_BASE | 171 | -301 | Main base — MARKETPLACE + SHIPYARD |
+| X1-BX78-B42 | ASTEROID | 74 | -375 | **Active mining asteroid** — COMMON_METAL_DEPOSITS (122 units from B7) |
+| X1-BX78-B8 | ASTEROID | ~160 | ~-290 | HOLLOWED_INTERIOR + MINERAL_DEPOSITS (close but poor) |
+| X1-BX78-B9 | ASTEROID | ~90 | ~-380 | MINERAL_DEPOSITS only |
+| X1-BX78-J86 | ASTEROID | 717 | -29 | DEEP_CRATERS + PRECIOUS_METAL_DEPOSITS — **too far** (610 units from B7, miner drifts) |
+| X1-BX78-J62 | ASTEROID_BASE | -698 | -167 | Contract delivery point (medicine contract); 879 units from B7 |
+| X1-BX78-H55 | PLANET | 45 | -6 | Previous contract delivery point; MARKETPLACE |
+| X1-BX78-A1 | PLANET | 4 | -25 | Faction HQ — negotiate contracts here |
+| X1-BX78-A2 | MOON | 4 | -25 | Shipyard #1 (same coords as A1, ~323 units from B7) |
+| X1-BX78-C45 | ORBITAL_STATION | ~11 | 116 | Shipyard #2 |
+| X1-BX78-H56 | MOON | 45 | -6 | Shipyard #3 |
+| X1-BX78-B6 | FUEL_STATION | -39 | -185 | 240 units from B7 — first hop westbound |
+| X1-BX78-C46 | FUEL_STATION | 11 | 116 | 447 units from B7 |
+| X1-BX78-I60 | FUEL_STATION | -222 | -53 | 465 units from B7 — second hop to J62 |
+| X1-BX78-J61 | FUEL_STATION | -582 | -139 | 770 units from B7 — third hop to J62 |
+| X1-BX78-I59 | JUMP_GATE | -436 | -104 | 638 units from B7; **active** — connects to X1-HS10, X1-VR75, X1-BY80, X1-HU32 |
+
+### Fuel Hop Chain: B7 → J62 (879 units)
+
+The miner can't CRUISE 879 units in one go (400 fuel cap). The correct multi-hop route:
+
+```
+B7 (start, 400 fuel) 
+  → B6 (240 units, FUEL_STATION — refuel)
+  → I60 (226 units from B6, FUEL_STATION — refuel)
+  → J61 (370 units from I60, FUEL_STATION — refuel)
+  → J62 (119 units from J61, destination)
+```
+
+Each leg is within the 400-unit fuel cap. **This required a bug fix** — see Decision Log.
+
+### MEDICINE Contract (current)
+
+- **Contract:** `cmqb1vckylp7cui6ymqqyxm9z` — PROCUREMENT, accepted, 0/24 MEDICINE → X1-BX78-J62
+- **Payout:** 158,600 cr on fulfillment
+- **Best source:** X1-BX78-D47 (EXPORT, ~2,379 cr/unit, vol=20, 327 units from B7)
+- **All 24 units already in cargo** — just needs delivery via the 4-hop route above
+
+### Known Issues Fixed This Session
+
+1. **Wrong asteroid in DB** (see Decision Log): first-run saved J86 (610 units) instead of B42 (122 units) — every miner leg was a 55-min DRIFT
+2. **`navigate_with_refuel` dead-end check** (see Decision Log): was rejecting B6 as an intermediate hop because J62 is >400 units from B6, causing drift to J62 instead of 4-hop cruise
+3. **`choose_mining_target` doesn't persist to DB**: now writes winner back to `agent_config` table so restarts don't regress to the initial DB value
+
+### Jump Gate
+
+X1-BX78-I59 is **live** (no construction needed). Connects to 4 systems. Currently unreachable on a single tank from B7 (638 units) but accessible via B6 → I60 → I59 with the fixed multi-hop routing. Useful for a future explorer ship.
 
 ---
 
@@ -869,6 +1091,20 @@ A record of specific choices made during development and why.
 | Contract selection | `pending[0]` — first available contract | `max(pending, key=_contract_score)` — scored by value | First-available could pick a 200k/500-unit contract over a 120k/100-unit one; per-unit scoring + deposit match bonus + delivery distance penalty makes the better choice obvious |
 | Sell market routing | Binary ">20% AND ≥500 cr" threshold | Continuous `net_value = revenue − round_trip × 2 × 20` | Binary threshold could route 400 units away for 600 cr gain (travel costs 16k cr). Net-value scoring makes this impossible — remote only wins when it clearly covers the round-trip cost |
 | Ship buy scoring | Static `SHIP_SCORES` lookup | `ship_score(type, miners, surveyors, haulers)` with composition rules | Static scores meant hauler (60) never won over miner (90) even at fleet size 5, leaving all delivery trips done by miners. Dynamic scoring grows hauler value as miner count rises — at 5 miners hauler scores 105, beating any miner |
+| DB asteroid wrong on restart (TYLERDEVRUN/X1-BX78) | `auto_configure` saves first-run asteroid (J86, 610 units from B7) | `choose_mining_target` now writes winner back to DB via `db.save_agent_config` | On first run the asteroid cache wasn't populated yet, so `auto_configure` picked J86 (best trait score: DEEP_CRATERS + PRECIOUS_METAL_DEPOSITS = 65 pts). But J86 is 610 units from B7, beyond the miner's 400 fuel cap → every leg was a 55-min DRIFT. `choose_mining_target` dynamically picks B42 (COMMON_METAL_DEPOSITS, 122 units, correct for IRON_ORE) but didn't persist it. Fixed: winner is now written to DB so restarts use the correct asteroid immediately. DB manually patched to B42. |
+| `navigate_with_refuel` dead-end check | Rejected intermediate hop if `remaining_dist > fuel_cap` | Removed: allow any hop that makes progress toward destination | Old check required each intermediate fuel market to be reachable from the destination in a single full tank. This rejected B6 (240 units from B7) because B6→J62 = 659 units > 400 fuel cap. Result: direct drift to J62 (879 units, ~55 min) instead of 4-hop cruise (B7→B6→I60→J61→J62, ~20 min total). Fixed: any reachable hop that reduces distance-to-destination is accepted; the 10-iteration loop chains them automatically. |
+| `SHIP_SCORES` Week2 reorder | ORE_HOUND=100, MINING_DRONE=90, SURVEYOR=75 (old strategy) | SURVEYOR=100, LIGHT_HAULER=95, ORE_HOUND=65, MINING_DRONE=60, SIPHON_DRONE=55 | Old order bought more miners before infrastructure. With 5 miners and no hauler, all delivery trips blocked miners. New strategy: 1 surveyor + 3 haulers first, then miners. Haulers keep all miners at the asteroid continuously; ROI on 3 haulers exceeds ROI on 3 additional miners at fleet size 4+. |
+| `MIN_FUEL_CAPACITY` blanket filter | 200 units (blocked MINING_DRONE with 80-unit tank) | Removed; replaced with `NO_DRIFT_DIST_MAX = 70` | Old filter rejected all small-tank ships regardless of route distance. MINING_DRONEs are safe when the asteroid is ≤70 units from a fuel market. `_is_mining_drone_safe()` checks the actual route before purchase instead of a blanket capacity gate. |
+| `CREDIT_RESERVE` | 30,000 | 50,000 | The old 30k value was set specifically to allow SURVEYOR purchase (~33k). With the Week2 fleet strategy (haulers + traders + explorers), we need a larger buffer for simultaneous multi-role operations. 50k covers emergency repairs + fuel for a 6-ship fleet + one market buy. |
+| `MIN_BUY_CREDITS` | 120,000 | 100,000 | Lowered because the cheapest useful purchase is now a SURVEYOR (~33k). At 100k we can buy a SURVEYOR or LIGHT_HAULER and retain the 50k reserve. The old 120k threshold was calibrated for a 86k LIGHT_SHUTTLE which is now never purchased. |
+| Dedicated hauler loop | (didn't exist — miners delivered themselves) | `hauler_loop()` with stationary miner cargo transfers | Miners now transfer entire cargo to hauler while remaining at the asteroid. Hauler shuttles to delivery + sell markets. Eliminates all miner travel overhead; at 4 miners the effective throughput gain is ~1-1.5 extra miner equivalents. |
+| Siphon loop | (didn't exist) | `siphon_loop()` targeting closest gas giant | Passive income stream from HYDROCARBON, LIQUID_HYDROGEN, etc. Guarded by `_is_siphon_reachable()` distance check before purchase. |
+| Trader loop | (didn't exist) | `trader_loop()` with arbitrage + backhaul + market scouting | Buys low/sells high using DB-backed arbitrage opportunities. When idle, scouts stale markets to keep price data fresh. Backhaul logic fills the otherwise-empty return leg for additional profit per trip. |
+| Explorer loop | (didn't exist) | `explorer_loop()` jumping to nearby systems | Scans remote system markets for price arbitrage leads and higher-paying ore buyers. Updates shared cache so haulers can route to better sell markets. |
+| Surveyor follows active mining target | Always navigated to global `ASTEROID` | Reads `_active_mining_wp`; repositions if miners have moved | Eliminates surveys being generated at the wrong asteroid when `choose_mining_target` routes miners elsewhere. Falls back to `ASTEROID` if the target is out of range for the surveyor's fuel cap. |
+| `DRY_EXTRACT_THRESHOLD` | (didn't exist — used only `_empty_loads` after 2 loads) | `DRY_EXTRACT_THRESHOLD = 5` consecutive zero-yield extractions | Old system waited for a full cargo load before escalating to buy mode. New threshold triggers early escalation after 5 consecutive misses regardless of cargo level — much faster response when the wrong deposit type is being mined. |
+| `MIN_CONTRACT_PAYOUT` | (didn't exist — accepted any contract) | `MIN_CONTRACT_PAYOUT = 30_000` | Prevents wasting fleet capacity on trivial contracts. If onFulfilled < 30k, the script tries to negotiate a better contract before accepting the low-value one. |
+| `CHEAP_BUY_THRESHOLD` | (didn't exist) | `CHEAP_BUY_THRESHOLD = 200 cr/unit` | Some mineable goods (e.g. SILICON_CRYSTALS) can be bought for 50 cr/unit — trivially cheaper than the fuel cost to mine them. Below this threshold, miners buy from market instead, freeing the asteroid slot for higher-value extractions. |
 
 ---
 
@@ -939,29 +1175,30 @@ Look for:
 ```python
 SYSTEM          = "X1-XXXX"         # your system
 COMMAND_SHIP    = "YOURAGENT-1"      # your first ship symbol
-ASTEROID        = "X1-XXXX-FD5D"    # ENGINEERED_ASTEROID (center cluster preferred)
-ASTEROID_BASE   = "X1-XXXX-H52"     # nearest market to asteroid (MARKETPLACE + SHIPYARD)
-SHIPYARD_WP     = "X1-XXXX-H52"     # shipyard waypoint (often same as ASTEROID_BASE)
-SHIPYARD_WPS    = ["X1-XXXX-H52", "X1-XXXX-A2"]  # all known shipyards
+ASTEROID        = "X1-XXXX-B42"     # closest COMMON_METAL_DEPOSITS within fuel cap
+ASTEROID_BASE   = "X1-XXXX-B7"      # nearest market (MARKETPLACE + SHIPYARD)
+SHIPYARD_WP     = "X1-XXXX-A2"      # primary shipyard (usually at faction HQ)
+SHIPYARD_WPS    = ["X1-XXXX-A2", "X1-XXXX-C45", "X1-XXXX-H56"]  # all known shipyards
 FLEET_MANAGER_SHIP = "YOURAGENT-2"  # second ship (non-miner)
+FACTION_HQ_WP   = "X1-XXXX-A1"     # faction HQ — for contract negotiation
 CREDIT_RESERVE  = 30_000
 MIN_BUY_CREDITS = 120_000
 MIN_SELL_PRICE  = 30
 ```
 
-Also update the hardcoded `"X1-HU91-A1"` in two places:
-- `get_next_contract()` (line ~1140)
-- `_bg_negotiate_contract()` (line ~940)
+**Critical:** Do NOT just pick the highest-trait-score asteroid (`auto_configure` does this at first run and will pick J86 / 610 units / DRIFT hell). Instead:
+1. Run the script once to populate the asteroid cache
+2. Check the logs for `choose_mining_target` output — it will show scores for B42 vs J86
+3. Verify the DB has the correct ASTEROID value: `SELECT value FROM agent_config WHERE key='ASTEROID'`
+4. If wrong, manually update: `UPDATE agent_config SET value='X1-BX78-B42' WHERE callsign='YOURAGENT' AND key='ASTEROID'`
 
-Replace both with your faction HQ waypoint.
+Also update `FACTION_HQ_WP` constant and search for any hardcoded `"X1-HU91-A1"` strings — replace all with your faction HQ waypoint.
 
 **Finding the best asteroid:** Run a full system waypoint scan (all pages), then look for:
-- `ENGINEERED_ASTEROID` type with `COMMON_METAL_DEPOSITS` trait — these yield refined metals
-- Compare distance from the asteroid to your contract delivery waypoints
-- Prefer asteroids with nearby markets (within 50 units) to keep round-trip time low
-
-The `discover_markets()` function does this automatically at startup — check its output
-to find the 29+ markets and identify the best cluster.
+- Asteroids with `COMMON_METAL_DEPOSITS` or `ENGINEERED_ASTEROID` type
+- Distance from asteroid to B7 must be ≤ miner fuel cap (400 for COMMAND_FRIGATE, 80 for MINING_DRONE)
+- Distance from asteroid to contract delivery must be manageable via fuel hop chain
+- Prefer asteroids with fuel stations nearby (within 50 units) to keep round-trip time low
 
 ### Step 6 — Get Your Second Ship
 
@@ -1003,18 +1240,20 @@ python play.py
 
 On competition day, the first 2 hours will have ships 3/4/5 still in transit.
 During that time:
-1. TYLERMASTERY-1 is the only active miner
-2. No surveyor yet → 0 copper ore is normal
-3. Once ships arrive: surveyor (TYLERMASTERY-4) goes to asteroid, survey pool fills,
-   copper ore yield jumps dramatically
-4. Credits accumulate; fleet manager buys more ships as soon as credits exceed
-   `ship_cost + CREDIT_RESERVE`
+1. TYLERDEVRUN-1 (or COMMAND_SHIP) is the only active miner
+2. Surveyors (TYLERDEVRUN-3/4) may not arrive at B42 for several minutes — no surveys initially
+3. Once surveyors arrive: survey pool fills, yield quality improves
+4. Credits accumulate; fleet manager buys more ships as soon as credits exceed `ship_cost + CREDIT_RESERVE`
+
+**Watch for the asteroid selection:** First run `auto_configure` may pick a high-trait but far asteroid (e.g., J86 in X1-BX78). Check `choose_mining_target` log output. If it picks a close asteroid (B42), all is well. If miners are DRIFTing (~55 min legs), the wrong asteroid is active — check and fix the DB.
 
 **Target progression:**
 - 0-2 hrs: 1 miner grinding, accumulating credits
-- 2 hrs: ships 3/4/5 arrive — surveyor online, 3 miners active
+- 2 hrs: surveyors arrive at B42 — yield improves
 - 4-6 hrs: enough credits to buy MINING_DRONE (~42k) or SURVEYOR (~33k) — fleet grows
-- 12+ hrs: fleet of 6-8 ships running concurrently
+- 12+ hrs: fleet of 4-6 ships running concurrently
+
+**Fuel hop chains:** Any delivery point more than 400 units away requires the `navigate_with_refuel` multi-hop path. Map the fuel stations between B7 and your delivery point before the run to confirm the chain exists.
 
 ### Strategy File
 
