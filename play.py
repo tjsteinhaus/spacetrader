@@ -59,6 +59,7 @@ def ship_log(ship_symbol: str, msg: str) -> None:
     color = _ship_color(ship_symbol)
     ts = datetime.now().strftime("%H:%M:%S")
     console.print(f"[dim]{ts}[/dim] [{color}]{ship_symbol}[/{color}] {msg}")
+    db.write_log(f"{ts} {ship_symbol} {msg}")
 
 # ── Market price cache (populated at runtime) ─────────────────────────────────
 _market_cache: dict[str, dict[str, int]] = {}   # {wp: {good: sell_price}}
@@ -86,10 +87,19 @@ _explorer_symbols: list[str] = []   # symbols of ships running explorer_loop
 _siphoner_symbols: list[str] = []   # symbols of ships running siphon_loop
 _trader_symbols:   list[str] = []   # symbols of ships running trader_loop
 
+# Last-known shipyard listings, keyed by waypoint symbol.
+# Populated after each fleet manager tour; used to skip tours when credits
+# are nowhere near affording any eligible ship.
+_shipyard_price_cache: dict[str, list[dict]] = {}
+
 # When working a direct-buy contract, only one ship does buy/deliver.
 # All other miners get this mine-only contract (fake good = "__SELL_ONLY__")
 # so they mine and sell ore for income without competing for the good.
 _mine_only_contract: dict | None = None
+
+# Ships that have been explicitly assigned to BUY (not mine) the contract good.
+# Set by work_contract when a miner is used as the fallback contract buyer.
+_contract_buy_ships: set[str] = set()
 
 # ── Active contract reference (set in work_contract, read by status table) ──────
 _active_contract: dict | None = None
@@ -111,7 +121,8 @@ DRY_EXTRACT_THRESHOLD  = 5          # consecutive zero-hit extractions before fo
 SELL_ROUTING_DIST_COST = 20         # cr per distance unit deducted from remote-market revenue (fuel + time proxy)
 MIN_CONTRACT_PAYOUT    = 30_000     # Skip contracts with onFulfilled < this and try to negotiate a better one
 FLEET_MANAGER_SHIP = "MASTERY-2"   # auto-set by auto_configure()
-MIN_FUEL_CAPACITY  = 150           # Skip ships whose fuel tank can't cover the asteroid↔base route
+MIN_FUEL_CAPACITY  = 0             # No blanket fuel check — no-drift gate handles small-tank ships
+NO_DRIFT_DIST_MAX  = 70            # Max distance from fuel market for mining/siphon drones
 
 # Goods extractable from asteroids — always mine these rather than purchase,
 # unless the market price is at or below CHEAP_BUY_THRESHOLD (trivial cost).
@@ -160,20 +171,19 @@ GOOD_TO_DEPOSIT_TRAITS: dict[str, frozenset[str]] = {
     "HYDROCARBON":      frozenset({"EXPLOSIVE_GASES"}),
 }
 
-# Ship purchase priority for mining contracts (higher score = buy first)
-# -1 means never buy; caps enforced in _bg_buy_and_launch
-# Rule: miners first → surveyors → haulers only once we have 2+ miners
+# Ship purchase priority — week2 plan (higher score = buy first)
+# -1 means never buy; dynamic blocking enforced in ship_score()
 SHIP_SCORES = {
-    "SHIP_ORE_HOUND":       100,  # Large miner — big fuel tank, worth it
-    "SHIP_MINING_DRONE":    -1,   # Disabled — small tank, drifts too much
-    "SHIP_SURVEYOR":        -1,   # Disabled — drifts too much
-    "SHIP_LIGHT_HAULER":    70,   # Hauler/trader — useful once we have 2+ miners
-    "SHIP_HEAVY_FREIGHTER": 65,   # Hauler alt — larger cargo if available
-    "SHIP_COMMAND_FRIGATE": -1,   # Disabled — drifts too much
-    "SHIP_SIPHON_DRONE":    -1,   # Disabled — drifts too much
-    "SHIP_GAS_DRONE":       -1,   # Disabled — drifts too much
-    "SHIP_LIGHT_SHUTTLE":   -1,   # Never buy — tiny cargo, wrong role
-    "SHIP_PROBE":           -1,   # Never buy
+    "SHIP_SURVEYOR":        100,  # First buy — boosts all miners immediately
+    "SHIP_LIGHT_HAULER":     95,  # Buy all 3 before anything else (big gap enforces order)
+    "SHIP_ORE_HOUND":        65,  # Best miner — only after all 3 haulers purchased
+    "SHIP_MINING_DRONE":     60,  # Cheap miner — no-drift check required
+    "SHIP_SIPHON_DRONE":     55,  # Passive gas — no-drift check required
+    "SHIP_HEAVY_FREIGHTER":  -1,  # Never buy
+    "SHIP_COMMAND_FRIGATE":  -1,  # Already have one
+    "SHIP_GAS_DRONE":        -1,  # Never buy
+    "SHIP_LIGHT_SHUTTLE":    -1,  # Never buy — tiny cargo, wrong role
+    "SHIP_PROBE":            -1,  # Never buy
 }
 
 MIN_SELL_PRICE     = 30     # cr/unit — jettison anything below this instead of hauling to market
@@ -213,6 +223,7 @@ def _get_ship_targets() -> list[dict]:
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     console.print(f"[dim]{ts}[/dim] {msg}")
+    db.write_log(f"{ts} {msg}")
 
 
 def wait_for_ship(ship_symbol: str, poll: int = 5) -> None:
@@ -246,7 +257,13 @@ def wait_for_ship(ship_symbol: str, poll: int = 5) -> None:
                 eta_str = f"{secs // 60}m {secs % 60}s"
             else:
                 eta_str = f"{secs}s"
-            ship_log(ship_symbol, f"[yellow]⏳ in transit (~{eta_str})...[/yellow]")
+            flight_mode = nav.get("flightMode", "")
+            mode_suffix = {
+                "BURN":   " 🔥burn",
+                "DRIFT":  " drift",
+                "CRUISE": "",
+            }.get(flight_mode, f" {flight_mode.lower()}" if flight_mode else "")
+            ship_log(ship_symbol, f"[yellow]⏳ in transit (~{eta_str}{mode_suffix})...[/yellow]")
             last_log = now
         time.sleep(30 if secs > 120 else poll)
 
@@ -628,6 +645,9 @@ def nearest_refuel_point(from_wp: str) -> str:
 _scored_asteroids: list[dict] = []                   # [{symbol, x, y, traits, trait_score, nearest_base, base_dist}]
 _asteroid_traits:  dict[str, frozenset[str]] = {}    # {symbol -> frozenset of trait symbols}
 
+# Tracks the asteroid where active miners are working — surveyors follow this.
+_active_mining_wp: str = ""   # set by choose_mining_target; surveyor_loop reads it
+
 
 def _populate_asteroid_cache() -> None:
     """Build _scored_asteroids and _asteroid_traits from DB (or API fallback).
@@ -743,6 +763,12 @@ def score_asteroid_for_miner(
     elif dist_from_ship > 200:
         score -= 10.0
 
+    # First-trip drift penalty: if the ship can't cruise back to base after
+    # the initial transit to this asteroid, it will be forced to drift home.
+    # dist_from_ship fuel is burned getting here; base_dist more is needed to return.
+    if ship_fuel_cap > 0 and (dist_from_ship + ast["base_dist"]) > ship_fuel_cap:
+        score -= 60.0   # strong deterrent — pick a closer asteroid instead
+
     # Delivery proximity (minor — asteroid closer to delivery WP = shorter trips)
     dx, dy = _get_coords(delivery_wp)
     dist_to_delivery = ((ast["x"] - dx) ** 2 + (ast["y"] - dy) ** 2) ** 0.5
@@ -823,6 +849,8 @@ def choose_mining_target(ship_symbol: str, contract: dict) -> str:
 
     best = scored[0][1]["symbol"]
     ship_log(ship_symbol, f"[cyan]→ mining at [bold]{best}[/bold][/cyan]")
+    global _active_mining_wp
+    _active_mining_wp = best  # surveyor follows the lead miner's chosen asteroid
     return best
 
 
@@ -1451,12 +1479,19 @@ def _surveyor_loop_inner(
     good = contract["terms"]["deliver"][0]["tradeSymbol"]
     ship_log(ship_symbol, f"[magenta]🔭 surveyor thread started[/magenta]")
 
-    # Preflight: get to ASTEROID_BASE for fuel, then to ASTEROID
+    # Wait briefly for the lead miner to call choose_mining_target (race condition:
+    # both threads start simultaneously; give the miner up to 30s to set the target).
+    _wait_start = time.time()
+    while not _active_mining_wp and time.time() - _wait_start < 30:
+        time.sleep(1)
+    survey_target = _active_mining_wp or ASTEROID
+
+    # Preflight: get to ASTEROID_BASE for fuel, then to survey_target
     _s0 = fleet_api.get_ship(ship_symbol)
     _wp0 = _s0["nav"]["waypointSymbol"]
     _f0  = _s0["fuel"]
     _fuel_pct0 = _f0["current"] / max(_f0["capacity"], 1) if _f0.get("capacity", 0) > 0 else 1.0
-    if _fuel_pct0 < 0.90 and _wp0 != ASTEROID:
+    if _fuel_pct0 < 0.90 and _wp0 != survey_target:
         _nearest = ASTEROID_BASE if _wp0 == ASTEROID_BASE else nearest_refuel_point(_wp0)
         ship_log(ship_symbol, f"[dim]surveyor preflight refuel at {_nearest}[/dim]")
         if _wp0 != _nearest:
@@ -1464,21 +1499,48 @@ def _surveyor_loop_inner(
         ensure_docked(ship_symbol)
         refuel_if_needed(ship_symbol, threshold=100_000)
 
-    navigate_with_refuel(ship_symbol, ASTEROID)
+    # Validate the surveyor can physically reach survey_target on one cruise tank.
+    # Small-tank ships (80 fuel) can't cruise to asteroids that have no fuel market
+    # within range — they'd drift for hours.  Fall back to ASTEROID if unreachable.
+    _sv_info = fleet_api.get_ship(ship_symbol)
+    _sv_fuel_cap = _sv_info["fuel"].get("capacity", 0)
+    if _sv_fuel_cap > 0 and survey_target != ASTEROID:
+        _fuel_markets = _good_exporters.get("FUEL", [])
+        _can_reach = any(
+            waypoint_distance(survey_target, fm) <= _sv_fuel_cap * 0.90
+            for fm in _fuel_markets
+        )
+        if not _can_reach:
+            ship_log(ship_symbol,
+                f"[yellow]🔭 surveyor: {survey_target} has no fuel market within "
+                f"{_sv_fuel_cap} units — falling back to {ASTEROID}[/yellow]")
+            survey_target = ASTEROID
+
+    ship_log(ship_symbol, f"[magenta]🔭 surveyor heading to: {survey_target}[/magenta]")
+    navigate_with_refuel(ship_symbol, survey_target)
     ensure_orbit(ship_symbol)
 
     while not stop_event.is_set() and not contract_done.is_set():
+        # Re-check in case miners switched asteroids
+        survey_target = _active_mining_wp or ASTEROID
+
         # Proactive fuel check: only refuel if NOT already at the asteroid.
         # Surveying costs no fuel, so let small ships survey before drifting back.
         _sv_ship = fleet_api.get_ship(ship_symbol)
         _sv_fuel = _sv_ship["fuel"]
-        _sv_at_asteroid = _sv_ship["nav"].get("waypointSymbol") == ASTEROID
+        _sv_wp   = _sv_ship["nav"].get("waypointSymbol")
+        _sv_at_asteroid = _sv_wp == survey_target
         if not _sv_at_asteroid and _sv_fuel.get("capacity", 0) > 0 and _sv_fuel["current"] / _sv_fuel["capacity"] < 0.50:
             ship_log(ship_symbol, f"[yellow]⛽ surveyor: fuel low, topping up[/yellow]")
             navigate_with_refuel(ship_symbol, ASTEROID_BASE)
             ensure_docked(ship_symbol)
             refuel_if_needed(ship_symbol, threshold=100_000)
-            navigate_with_refuel(ship_symbol, ASTEROID)
+            navigate_with_refuel(ship_symbol, survey_target)
+            ensure_orbit(ship_symbol)
+        elif not _sv_at_asteroid:
+            # Miners may have moved — reposition
+            ship_log(ship_symbol, f"[magenta]🔭 surveyor repositioning to {survey_target}[/magenta]")
+            navigate_with_refuel(ship_symbol, survey_target)
             ensure_orbit(ship_symbol)
 
         if stop_event.is_set() or contract_done.is_set():
@@ -1634,12 +1696,14 @@ def _hauler_loop_inner(
                             if _dt2["tradeSymbol"] == good:
                                 _f   = _dt2["unitsFulfilled"]
                                 _req = _dt2["unitsRequired"]
+                                db.record_delivery(cid, good, ship_symbol, _to_deliver, _f, _req)
                                 ship_log(ship_symbol, f"[green]✓ hauler: {_f}/{_req} {good} delivered[/green]")
                                 if _f >= _req:
                                     with _fulfill_lock:
                                         if not contract_done.is_set():
                                             _res = contracts_api.fulfill_contract(cid)
                                             _ag  = _res.get("agent", {})
+                                            db.record_credits(_ag.get("credits", 0))
                                             log(f"[green bold]🏆 Contract fulfilled! Credits: {_ag.get('credits', 0):,}[/green bold]")
                                             contract_done.set()
                                     return
@@ -1745,12 +1809,14 @@ def _miner_loop_inner(
                             if dt["tradeSymbol"] == good:
                                 f = dt["unitsFulfilled"]
                                 req = dt["unitsRequired"]
+                                db.record_delivery(cid, good, ship_symbol, _deliver_amt, f, req)
                                 ship_log(ship_symbol, f"[green]✓ {f}/{req} {good} delivered (preflight)[/green]")
                                 if f >= req:
                                     with _fulfill_lock:
                                         if not contract_done.is_set():
                                             res = contracts_api.fulfill_contract(cid)
                                             ag = res.get("agent", {})
+                                            db.record_credits(ag.get("credits", 0))
                                             log(f"[green bold]🏆 Contract fulfilled! Credits: {ag.get('credits', 0):,}[/green bold]")
                                             contract_done.set()
                                     return
@@ -1777,24 +1843,31 @@ def _miner_loop_inner(
         _required_traits = GOOD_TO_DEPOSIT_TRAITS.get(good, frozenset())
         ship_log(ship_symbol, f"[yellow]{good} requires {sorted(_required_traits)} — not present in any scanned asteroid, skipping straight to buy[/yellow]")
 
+    # Also force buy if this ship was explicitly assigned as the contract buyer
+    # (e.g. solo miner used as fallback — buying is faster than mining alone).
+    _forced_buyer = ship_symbol in _contract_buy_ships
+
     _direct_buy = bool(
         _buy_wp_check
         and (
             not _is_mineable
             or _no_deposit
             or (_buy_price_check > 0 and _buy_price_check <= CHEAP_BUY_THRESHOLD)
+            or _forced_buyer
         )
     )
     if _direct_buy:
         _reason = (
-            "no deposit in system" if _no_deposit
+            "forced buyer — solo miner buys instead of mines" if _forced_buyer and _is_mineable and not _no_deposit
+            else "no deposit in system" if _no_deposit
             else "cheap ore" if _is_mineable
             else "non-mineable good"
         )
         ship_log(ship_symbol, f"[cyan]{good} will be purchased ({_reason} @ {_buy_price_check:,} cr/u)[/cyan]")
-        # Non-mineable goods and no-deposit goods skip the asteroid entirely.
+        # Non-mineable / no-deposit goods skip the asteroid entirely and go straight to market.
+        # Forced buyers (solo miner assigned to buy) also skip the asteroid.
         # Cheap ores still visit the asteroid base (serves as a refuel waypoint en route).
-        if (_no_deposit or not _is_mineable) and _buy_wp_check:
+        if (_no_deposit or not _is_mineable or _forced_buyer) and _buy_wp_check:
             navigate_with_refuel(ship_symbol, _buy_wp_check)
         else:
             navigate_with_refuel(ship_symbol, ASTEROID_BASE)
@@ -1919,12 +1992,14 @@ def _miner_loop_inner(
                         if dt["tradeSymbol"] == good:
                             f = dt["unitsFulfilled"]
                             req = dt["unitsRequired"]
+                            db.record_delivery(cid, good, ship_symbol, have, f, req)
                             ship_log(ship_symbol, f"[green]✓ {f}/{req} {good} delivered[/green]")
                             if f >= req:
                                 with _fulfill_lock:
                                     if not contract_done.is_set():
                                         res = contracts_api.fulfill_contract(cid)
                                         ag = res.get("agent", {})
+                                        db.record_credits(ag.get("credits", 0))
                                         log(f"[green bold]🏆 Contract fulfilled! Credits: {ag.get('credits', 0):,}[/green bold]")
                                         contract_done.set()
                                 return
@@ -1950,10 +2025,16 @@ def _miner_loop_inner(
                     _dry_extractions = 0
                 _empty_loads += 1
                 if _direct_buy:
-                    # Already in buy mode — skip the asteroid-base junk run entirely.
-                    # Cargo is empty (just delivered), so there's nothing to sell.
-                    # Go straight to the buy market.
-                    pass
+                    # Sell any junk cargo before heading to the buy market so all
+                    # cargo slots are free for the contract good.
+                    _ship_check = fleet_api.get_ship(ship_symbol)
+                    _cargo_items = _ship_check.get("cargo", {}).get("inventory", [])
+                    _has_junk = any(i["symbol"] != good for i in _cargo_items if i.get("units", 0) > 0)
+                    if _has_junk:
+                        sell_junk(ship_symbol, good)
+                        navigate_with_refuel(ship_symbol, ASTEROID_BASE)
+                        ensure_docked(ship_symbol)
+                        refuel_if_needed(ship_symbol, threshold=100_000)
                 else:
                     navigate_with_refuel(ship_symbol, ASTEROID_BASE)
                     ensure_docked(ship_symbol)
@@ -1972,6 +2053,23 @@ def _miner_loop_inner(
                         ensure_docked(ship_symbol)
                         _market_cache_ts.pop(_buy_wp, None)  # force fresh query while docked
                         get_market_prices(_buy_wp)  # populate cache (needs ship present)
+                        # Log and store full market snapshot
+                        _market_raw = universe_api.get_market(SYSTEM, _buy_wp)
+                        _trade_goods = _market_raw.get("tradeGoods", [])
+                        db.log_market_visit(_buy_wp, ship_symbol, _trade_goods)
+                        if _trade_goods:
+                            _good_lines = "  ".join(
+                                f"[cyan]{g['symbol']}[/cyan] buy=[green]{g.get('purchasePrice',0):,}[/green] sell=[yellow]{g.get('sellPrice',0):,}[/yellow] vol={g.get('tradeVolume','?')} supply={g.get('supply','?')}"
+                                for g in sorted(_trade_goods, key=lambda x: x.get("symbol",""))
+                            )
+                            ship_log(ship_symbol, f"[dim]{_buy_wp} market ({len(_trade_goods)} goods):[/dim]")
+                            for _g in sorted(_trade_goods, key=lambda x: x.get("symbol", "")):
+                                ship_log(ship_symbol,
+                                    f"  [cyan]{_g['symbol']:22s}[/cyan] "
+                                    f"buy=[green]{_g.get('purchasePrice',0):>6,}[/green] "
+                                    f"sell=[yellow]{_g.get('sellPrice',0):>6,}[/yellow] "
+                                    f"vol={_g.get('tradeVolume','?'):>4}  supply={_g.get('supply','?')}"
+                                )
                         _buy_price = _market_cache.get(_buy_wp, {}).get(f"_buy_{good}", 0)
                         if _buy_price > 0:
                             _me = agent_api.get_my_agent()
@@ -2572,6 +2670,10 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
                     f"[magenta]💰 {ship_symbol}: sold {have}x {good} @ {_sell_price:,}/u "
                     f"= {_sell_total_rev:,} cr (profit: +{actual_profit:,} cr)[/magenta]"
                 )
+                db.log_trade_trip(
+                    _trip_id, ship_symbol, good, buy_wp, sell_wp,
+                    have, live_buy * have, _sell_total_rev,
+                )
 
         # ── Backhaul: buy at current location before dead-leg return ─────────
         if not _sell_failed:
@@ -2653,10 +2755,18 @@ def _trader_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
                                     sell_junk(ship_symbol, "__NONE__")
                                     break
                             if _bh_rev > 0:
+                                _bh_profit = _bh_rev - _bh['buy_price'] * _bh_have
                                 log(
                                     f"[cyan]💰 {ship_symbol}: backhaul sold {_bh_have}x {_bh['trade_symbol']} "
                                     f"@ {_bh_sp:,}/u = {_bh_rev:,} cr "
-                                    f"(profit: +{_bh_rev - _bh['buy_price'] * _bh_have:,} cr)[/cyan]"
+                                    f"(profit: +{_bh_profit:,} cr)[/cyan]"
+                                )
+                                db.log_trade_trip(
+                                    _bh_trip_id, ship_symbol, _bh["trade_symbol"],
+                                    sell_wp, _bh["sell_at"],
+                                    _bh_have,
+                                    _bh["buy_price"] * _bh_have, _bh_rev,
+                                    trip_type="backhaul",
                                 )
 
 
@@ -2878,6 +2988,31 @@ def _bg_buy_and_launch(
             return False
         return True
 
+    # Short-circuit: if every fleet cap is already met, no point touring.
+    _KNOWN_SHIP_TYPES = [
+        "SHIP_ORE_HOUND", "SHIP_MINING_DRONE", "SHIP_COMMAND_FRIGATE",
+        "SHIP_SURVEYOR", "SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER",
+    ]
+    _eligible_types = set(t for t in _KNOWN_SHIP_TYPES if _should_buy(t))
+    if not _eligible_types:
+        log("[dim]Fleet manager: all fleet caps met — skipping shipyard tour[/dim]")
+        return
+
+    # Short-circuit: use last-known prices to skip the tour when we can't
+    # afford the cheapest eligible ship yet.
+    if _shipyard_price_cache:
+        _min_price = min(
+            (s["purchasePrice"] for ships in _shipyard_price_cache.values()
+             for s in ships if s.get("type") in _eligible_types),
+            default=None,
+        )
+        if _min_price is not None and credits - _min_price < CREDIT_RESERVE:
+            log(
+                f"[dim]Fleet manager: cheapest eligible ship ~{_min_price:,} cr, "
+                f"only {credits:,} cr available — skipping tour[/dim]"
+            )
+            return
+
     # Collect candidates from ALL shipyards so miners/surveyors at secondary
     # yards aren't missed in favour of shuttles at the primary yard.
     all_candidates: list[tuple[int, int, str, str]] = []  # (score, price, type, yard_wp)
@@ -2890,6 +3025,7 @@ def _bg_buy_and_launch(
         ensure_docked(FLEET_MANAGER_SHIP)
 
         shipyard = universe_api.get_shipyard(SYSTEM, yd_wp)
+        _shipyard_price_cache[yd_wp] = shipyard.get("ships", [])  # refresh cache
         for s in shipyard.get("ships", []):
             stype = s.get("type", "")
             if not _should_buy(stype):
@@ -2899,7 +3035,7 @@ def _bg_buy_and_launch(
                 log(f"[yellow]Fleet manager: skipping {stype} at {yd_wp} — fuel tank too small ({fuel_cap} < {MIN_FUEL_CAPACITY})[/yellow]")
                 continue
             all_candidates.append((
-                ship_score(stype, current_miners),
+                ship_score(stype, current_miners, current_surveyors, current_haulers),
                 s["purchasePrice"],
                 stype,
                 yd_wp,
@@ -3081,9 +3217,9 @@ def fleet_manager_loop(
         if not _manager_lock.acquire(blocking=False):
             continue  # another management op in progress — skip this tick
         try:
-            _bg_buy_and_launch(contract, contract_done, stop_event)
+            _bg_negotiate_contract()
             if not stop_event.is_set():
-                _bg_negotiate_contract()
+                _bg_buy_and_launch(contract, contract_done, stop_event)
             if not stop_event.is_set():
                 _bg_scan_next_market()
         except Exception as e:
@@ -3114,6 +3250,7 @@ def _print_status_table(contract: dict | None = None) -> None:
     t.add_column("Ship", style="bold")
     t.add_column("Role")
     t.add_column("Status")
+    t.add_column("From")
     t.add_column("Location")
     t.add_column("Fuel", justify="right")
     t.add_column("Cargo", justify="right")
@@ -3174,18 +3311,32 @@ def _print_status_table(contract: dict | None = None) -> None:
                     flight_mode = nav.get("flightMode", "")
                     if flight_mode == "DRIFT":
                         eta_str = f"[dim]{eta_str} drift[/dim]"
+                    elif flight_mode == "BURN":
+                        eta_str = f"[yellow]{eta_str} 🔥burn[/yellow]"
+                    elif flight_mode == "CRUISE":
+                        eta_str = f"{eta_str} cruise"
                 except Exception:
                     pass
+
+        # From waypoint (only meaningful in transit)
+        from_str = ""
+        if status == "IN_TRANSIT":
+            from_str = nav.get("route", {}).get("departure", {}).get("symbol", "")
 
         t.add_row(
             f"[{color}]{sym}[/{color}]",
             role_label,
             status_icon,
+            from_str,
             wp,
             fuel_str,
             cargo_str,
             eta_str,
         )
+
+        # Persist cargo snapshot to DB for historical tracking
+        goods = [{"symbol": i["symbol"], "units": i["units"]} for i in cargo.get("inventory", [])]
+        db.record_ship_cargo(sym, wp, status, cargo["units"], cargo["capacity"], goods)
 
     console.print(t)
 
@@ -3213,6 +3364,7 @@ def _print_status_table(contract: dict | None = None) -> None:
 def work_contract(contract: dict) -> None:
     """Accept (if needed) then run all miners in parallel until contract is fulfilled."""
     global _active_contract
+    _contract_buy_ships.clear()  # reset per-contract buy assignments
     with _active_contract_lock:
         _active_contract = contract
     cid     = contract["id"]
@@ -3305,6 +3457,8 @@ def work_contract(contract: dict) -> None:
             _contract_buyer = miners[0]
             _haulers_for_buy = []
             _haulers_for_trade = []
+            # Mark this miner as a forced buyer so _miner_loop_inner skips mining
+            _contract_buy_ships.add(miners[0])
             log(f"[cyan]Direct-buy contract: {miners[0]} handles buy/deliver (no hauler available); "
                 f"{len(miners)-1} miner(s) mine for income[/cyan]")
     else:
@@ -3321,9 +3475,13 @@ def work_contract(contract: dict) -> None:
                 _trader_symbols.extend(_haulers_for_trade)
                 log(f"[blue]Launching {len(_haulers_for_trade)} hauler(s) as trader(s) (direct-buy contract): {_haulers_for_trade}[/blue]")
         else:
+            # Mining contract: first hauler is dedicated contract hauler, rest are traders
             _hauler_symbols.clear()
-            _hauler_symbols.extend(haulers)
-            log(f"[blue]Launching {len(haulers)} hauler thread(s): {haulers}[/blue]")
+            _hauler_symbols.extend(haulers[:1])
+            if haulers[1:]:
+                _trader_symbols.extend(haulers[1:])
+            log(f"[blue]Launching hauler {haulers[0]} as contract hauler"
+                + (f"; {haulers[1:]} as trader(s)" if haulers[1:] else "") + "[/blue]")
     if siphoners:
         _siphoner_symbols.clear()
         _siphoner_symbols.extend(siphoners)
@@ -3362,14 +3520,31 @@ def work_contract(contract: dict) -> None:
         )
         for hauler in _haulers_for_buy
     ]
+    if _mine_only_contract is not None:
+        # Direct-buy: remaining haulers are traders
+        _mining_hauler_traders = _haulers_for_trade
+        _mining_hauler_miningc = []
+    else:
+        # Mining contract: haulers[0] delivers ore, rest run arbitrage
+        _mining_hauler_miningc = haulers[:1]
+        _mining_hauler_traders = haulers[1:]
     threads += [
         threading.Thread(
-            target=trader_loop if _mine_only_contract is not None else hauler_loop,
+            target=hauler_loop,
             args=(hauler, contract, contract_done, stop_event),
             daemon=True,
             name=f"hauler-{hauler}",
         )
-        for hauler in (_haulers_for_trade if _mine_only_contract is not None else haulers)
+        for hauler in _mining_hauler_miningc
+    ]
+    threads += [
+        threading.Thread(
+            target=trader_loop,
+            args=(hauler, contract, contract_done, stop_event),
+            daemon=True,
+            name=f"hauler-{hauler}",
+        )
+        for hauler in _mining_hauler_traders
     ]
     threads += [
         threading.Thread(
@@ -3412,6 +3587,30 @@ def work_contract(contract: dict) -> None:
 
 # ── Ship buying ───────────────────────────────────────────────────────────────
 
+def _is_mining_drone_safe() -> bool:
+    """True if ASTEROID is within NO_DRIFT_DIST_MAX units of a fuel market."""
+    fuel_markets = _good_exporters.get("FUEL", [])
+    if not fuel_markets:
+        return False
+    nearest = min(fuel_markets, key=lambda wp: waypoint_distance(ASTEROID, wp))
+    return waypoint_distance(ASTEROID, nearest) <= NO_DRIFT_DIST_MAX
+
+
+def _is_siphon_reachable() -> bool:
+    """True if any gas giant in the system is within NO_DRIFT_DIST_MAX units of a fuel market."""
+    gas_giants = _find_gas_giants()
+    if not gas_giants:
+        return False
+    fuel_markets = _good_exporters.get("FUEL", [])
+    if not fuel_markets:
+        return False
+    for gg in gas_giants:
+        nearest = min(fuel_markets, key=lambda wp: waypoint_distance(gg, wp))
+        if waypoint_distance(gg, nearest) <= NO_DRIFT_DIST_MAX:
+            return True
+    return False
+
+
 def ship_score(
     ship_type: str,
     current_miner_count: int,
@@ -3422,43 +3621,51 @@ def ship_score(
     Score a ship type for purchase priority.  Higher = more desirable to buy.
     -1 means skip entirely.
 
-    Dynamic adjustments based on current fleet composition:
-    - Haulers: blocked until 2+ miners; priority rises with miner count so that
-      once 3+ miners are wasting time on delivery runs a hauler jumps above extra miners.
-    - Surveyors: blocked until 2+ miners (need miners to share the survey pool);
-      capped at 1 surveyor.
-    - Miners: slight score reduction above 5 (diminishing returns).
+    Week2 ordering:
+    - Surveyor (100): always buy up to cap — boosts all miners
+    - Light Hauler (95): always buy up to cap — 1 hauler, 2 traders
+    - Ore Hound (65): only after all 3 haulers purchased
+    - Mining Drone (60): after haulers capped + no-drift check
+    - Siphon Drone (55): after haulers capped + no-drift check
     """
-    base = SHIP_SCORES.get(ship_type, 30)  # unknown types get a mediocre score
+    base = SHIP_SCORES.get(ship_type, -1)  # unknown types are skipped
     if base < 0:
         return -1
 
-    _hauler_types = ("SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER", "SHIP_LIGHT_SHUTTLE")
-
-    if ship_type in _hauler_types:
-        if current_miner_count < 2 or current_hauler_count >= 3:
-            return -1
-        # With 3+ miners each delivery run wastes mining time — hauler frees that up.
-        # Boost score above extra miners once we reach that threshold.
-        if current_miner_count >= 3:
-            return base + (current_miner_count - 2) * 15
-        return base
-
     if ship_type == "SHIP_SURVEYOR":
-        if current_miner_count < 2 or current_surveyor_count >= 2:
-            return -1  # not enough miners to share surveys / already have two
-        return base
-
-    if ship_type in ("SHIP_ORE_HOUND", "SHIP_MINING_DRONE"):
-        if current_miner_count >= 8:
-            return max(base - 30, 10)  # diminishing returns above 8 miners
-        return base
-
-    # Cap siphon/gas drones at 3 total; require at least 2 miners first
-    if ship_type in ("SHIP_SIPHON_DRONE", "SHIP_GAS_DRONE"):
-        if current_miner_count < 2:
+        if current_surveyor_count >= 1:
             return -1
-        if len(_siphoner_symbols) >= 3:
+        return base
+
+    if ship_type in ("SHIP_LIGHT_HAULER", "SHIP_LIGHT_SHUTTLE"):
+        if current_hauler_count >= 3:
+            return -1
+        return base
+
+    if ship_type == "SHIP_ORE_HOUND":
+        if current_hauler_count < 3:
+            return -1  # wait until all 3 haulers are in the fleet
+        if current_miner_count >= 8:
+            return max(base - 30, 10)
+        return base
+
+    if ship_type == "SHIP_MINING_DRONE":
+        if current_hauler_count < 3:
+            return -1
+        if not _is_mining_drone_safe():
+            log("[dim]Fleet manager: MINING_DRONE skipped — asteroid too far from fuel market[/dim]")
+            return -1
+        if current_miner_count >= 8:
+            return max(base - 30, 10)
+        return base
+
+    if ship_type in ("SHIP_SIPHON_DRONE", "SHIP_GAS_DRONE"):
+        if current_hauler_count < 3:
+            return -1
+        if len(_siphoner_symbols) >= 2:
+            return -1
+        if not _is_siphon_reachable():
+            log("[dim]Fleet manager: SIPHON_DRONE skipped — gas giant too far from fuel market[/dim]")
             return -1
         return base
 
@@ -3871,6 +4078,7 @@ def run() -> None:
     while True:
         loop += 1
         me = agent_api.get_my_agent()
+        db.record_credits(me["credits"])
         log(f"[bold]─── Loop {loop} | Credits: {me['credits']:,} | Ships: {me['shipCount']} ───[/bold]")
 
         contract = get_next_contract()

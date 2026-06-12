@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.pyo
 game_data.db
+node_modules

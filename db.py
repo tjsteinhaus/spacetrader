@@ -227,6 +227,79 @@ CREATE TABLE IF NOT EXISTS bot_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS trade_trips (
+    trip_id          TEXT PRIMARY KEY,
+    ship_symbol      TEXT NOT NULL,
+    trade_symbol     TEXT NOT NULL,
+    buy_waypoint     TEXT NOT NULL,
+    sell_waypoint    TEXT NOT NULL,
+    units            INTEGER NOT NULL,
+    buy_total        INTEGER NOT NULL,
+    sell_total       INTEGER NOT NULL,
+    profit           INTEGER NOT NULL,
+    trip_type        TEXT NOT NULL DEFAULT 'arbitrage',
+    timestamp        REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trade_trips_ship
+    ON trade_trips(ship_symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_trade_trips_good
+    ON trade_trips(trade_symbol, timestamp);
+
+CREATE TABLE IF NOT EXISTS bot_logs (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    message   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bot_logs_ts ON bot_logs(timestamp);
+
+CREATE TABLE IF NOT EXISTS credits_history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    credits   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_credits_ts ON credits_history(timestamp);
+
+CREATE TABLE IF NOT EXISTS contract_progress (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       REAL NOT NULL,
+    contract_id     TEXT NOT NULL,
+    trade_symbol    TEXT NOT NULL,
+    ship_symbol     TEXT NOT NULL,
+    units_delivered INTEGER NOT NULL,
+    units_fulfilled INTEGER NOT NULL,
+    units_required  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cp_contract ON contract_progress(contract_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS market_price_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       REAL NOT NULL,
+    waypoint_symbol TEXT NOT NULL,
+    ship_symbol     TEXT NOT NULL,
+    trade_symbol    TEXT NOT NULL,
+    listing_type    TEXT,
+    supply          TEXT,
+    activity        TEXT,
+    purchase_price  INTEGER,
+    sell_price      INTEGER,
+    trade_volume    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_mph_wp ON market_price_history(waypoint_symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_mph_good ON market_price_history(trade_symbol, timestamp);
+
+CREATE TABLE IF NOT EXISTS ship_cargo_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       REAL NOT NULL,
+    ship_symbol     TEXT NOT NULL,
+    waypoint_symbol TEXT NOT NULL,
+    nav_status      TEXT NOT NULL,
+    cargo_units     INTEGER NOT NULL DEFAULT 0,
+    cargo_capacity  INTEGER NOT NULL DEFAULT 0,
+    cargo_goods     TEXT NOT NULL DEFAULT '[]'  -- JSON: [{symbol, units}, ...]
+);
+CREATE INDEX IF NOT EXISTS idx_scs_ship ON ship_cargo_snapshots(ship_symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_scs_ts   ON ship_cargo_snapshots(timestamp);
 """
 
 
@@ -239,6 +312,7 @@ def init_db(path: Path | str | None = None) -> None:
             txn_cols_pre = {r[1] for r in con.execute("PRAGMA table_info(market_transactions)").fetchall()}
             if "trip_id" not in txn_cols_pre:
                 con.execute("ALTER TABLE market_transactions ADD COLUMN trip_id TEXT")
+                con.commit()
         con.executescript(_SCHEMA)
         # Migrate existing contracts table — add timing columns if absent
         existing = {r[1] for r in con.execute("PRAGMA table_info(contracts)").fetchall()}
@@ -246,6 +320,60 @@ def init_db(path: Path | str | None = None) -> None:
             con.execute("ALTER TABLE contracts ADD COLUMN accepted_at REAL")
         if "fulfilled_at" not in existing:
             con.execute("ALTER TABLE contracts ADD COLUMN fulfilled_at REAL")
+        # Migrate credits_history / contract_progress (added later — safe no-op if present)
+        tables2 = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "credits_history" not in tables2:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS credits_history (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    credits   INTEGER NOT NULL
+                )""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_credits_ts ON credits_history(timestamp)")
+        if "contract_progress" not in tables2:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS contract_progress (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       REAL NOT NULL,
+                    contract_id     TEXT NOT NULL,
+                    trade_symbol    TEXT NOT NULL,
+                    ship_symbol     TEXT NOT NULL,
+                    units_delivered INTEGER NOT NULL,
+                    units_fulfilled INTEGER NOT NULL,
+                    units_required  INTEGER NOT NULL
+                )""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_cp_contract ON contract_progress(contract_id, timestamp)")
+        if "market_price_history" not in tables2:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS market_price_history (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       REAL NOT NULL,
+                    waypoint_symbol TEXT NOT NULL,
+                    ship_symbol     TEXT NOT NULL,
+                    trade_symbol    TEXT NOT NULL,
+                    listing_type    TEXT,
+                    supply          TEXT,
+                    activity        TEXT,
+                    purchase_price  INTEGER,
+                    sell_price      INTEGER,
+                    trade_volume    INTEGER
+                )""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_mph_wp ON market_price_history(waypoint_symbol, timestamp)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_mph_good ON market_price_history(trade_symbol, timestamp)")
+        if "ship_cargo_snapshots" not in tables2:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS ship_cargo_snapshots (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       REAL NOT NULL,
+                    ship_symbol     TEXT NOT NULL,
+                    waypoint_symbol TEXT NOT NULL,
+                    nav_status      TEXT NOT NULL,
+                    cargo_units     INTEGER NOT NULL DEFAULT 0,
+                    cargo_capacity  INTEGER NOT NULL DEFAULT 0,
+                    cargo_goods     TEXT NOT NULL DEFAULT '[]'
+                )""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_scs_ship ON ship_cargo_snapshots(ship_symbol, timestamp)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_scs_ts   ON ship_cargo_snapshots(timestamp)")
         # Seed deposit_goods (INSERT OR IGNORE so re-runs are idempotent)
         con.executemany(
             "INSERT OR IGNORE INTO deposit_goods (trait_symbol, trade_symbol) VALUES (?, ?)",
@@ -293,6 +421,129 @@ def set_bot_setting(key: str, value: str) -> None:
             "INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)",
             (key, value),
         )
+
+
+def write_log(message: str) -> None:
+    """Write a log entry to the bot_logs table for dashboard consumption."""
+    try:
+        with _conn() as con:
+            con.execute(
+                "INSERT INTO bot_logs (timestamp, message) VALUES (?, ?)",
+                (time.time(), message),
+            )
+            # Keep only the last 2000 entries to prevent unbounded growth
+            con.execute(
+                "DELETE FROM bot_logs WHERE id NOT IN "
+                "(SELECT id FROM bot_logs ORDER BY id DESC LIMIT 2000)"
+            )
+    except Exception:
+        pass  # Never crash the bot over a log write failure
+
+
+def record_credits(credits: int) -> None:
+    """Snapshot current credit balance for time-series charting."""
+    try:
+        with _conn() as con:
+            con.execute(
+                "INSERT INTO credits_history (timestamp, credits) VALUES (?, ?)",
+                (time.time(), credits),
+            )
+            # Keep ~30 days at 1-minute resolution (43,200 rows)
+            con.execute(
+                "DELETE FROM credits_history WHERE id NOT IN "
+                "(SELECT id FROM credits_history ORDER BY id DESC LIMIT 43200)"
+            )
+    except Exception:
+        pass
+
+
+def record_delivery(
+    contract_id: str,
+    trade_symbol: str,
+    ship_symbol: str,
+    units_delivered: int,
+    units_fulfilled: int,
+    units_required: int,
+) -> None:
+    """Log a single contract delivery event."""
+    try:
+        with _conn() as con:
+            con.execute(
+                "INSERT INTO contract_progress "
+                "(timestamp, contract_id, trade_symbol, ship_symbol, "
+                " units_delivered, units_fulfilled, units_required) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), contract_id, trade_symbol, ship_symbol,
+                 units_delivered, units_fulfilled, units_required),
+            )
+    except Exception:
+        pass
+
+
+def record_ship_cargo(
+    ship_symbol: str,
+    waypoint_symbol: str,
+    nav_status: str,
+    cargo_units: int,
+    cargo_capacity: int,
+    cargo_goods: list[dict],
+) -> None:
+    """Snapshot a ship's cargo hold to the DB. Called each status table print."""
+    import json
+    try:
+        with _conn() as con:
+            con.execute(
+                "INSERT INTO ship_cargo_snapshots "
+                "(timestamp, ship_symbol, waypoint_symbol, nav_status, "
+                " cargo_units, cargo_capacity, cargo_goods) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), ship_symbol, waypoint_symbol, nav_status,
+                 cargo_units, cargo_capacity, json.dumps(cargo_goods)),
+            )
+            # Keep the last 10,000 rows per ship to avoid unbounded growth
+            con.execute(
+                "DELETE FROM ship_cargo_snapshots WHERE id NOT IN "
+                "(SELECT id FROM ship_cargo_snapshots ORDER BY id DESC LIMIT 50000)"
+            )
+    except Exception:
+        pass
+
+
+def log_market_visit(
+    waypoint_symbol: str,
+    ship_symbol: str,
+    trade_goods: list[dict],
+) -> None:
+    """Append a timestamped snapshot of all trade goods to market_price_history."""
+    if not trade_goods:
+        return
+    now = time.time()
+    try:
+        with _conn() as con:
+            con.executemany(
+                """INSERT INTO market_price_history
+                   (timestamp, waypoint_symbol, ship_symbol, trade_symbol,
+                    listing_type, supply, activity, purchase_price, sell_price, trade_volume)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        now,
+                        waypoint_symbol,
+                        ship_symbol,
+                        g.get("symbol", ""),
+                        g.get("type"),
+                        g.get("supply"),
+                        g.get("activity"),
+                        g.get("purchasePrice"),
+                        g.get("sellPrice"),
+                        g.get("tradeVolume"),
+                    )
+                    for g in trade_goods if g.get("symbol")
+                ],
+            )
+            # Keep 90 days at ~hourly resolution per waypoint (no hard cap — indexes keep it fast)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +762,65 @@ def log_transaction(
             (waypoint_symbol, ship_symbol, trade_symbol, txn_type,
              units, price_per_unit, total_price, time.time(), trip_id),
         )
+
+
+def log_trade_trip(
+    trip_id: str,
+    ship_symbol: str,
+    trade_symbol: str,
+    buy_waypoint: str,
+    sell_waypoint: str,
+    units: int,
+    buy_total: int,
+    sell_total: int,
+    trip_type: str = "arbitrage",
+    path: Path | str | None = None,
+) -> None:
+    """Record a completed arbitrage round-trip for P&L tracking and ML training."""
+    with _conn(path) as con:
+        con.execute(
+            """INSERT OR REPLACE INTO trade_trips
+               (trip_id, ship_symbol, trade_symbol, buy_waypoint, sell_waypoint,
+                units, buy_total, sell_total, profit, trip_type, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trip_id, ship_symbol, trade_symbol, buy_waypoint, sell_waypoint,
+             units, buy_total, sell_total, sell_total - buy_total, trip_type, time.time()),
+        )
+
+
+def get_trade_stats(
+    ship_symbol: str | None = None,
+    since_hours: float = 24.0,
+    path: Path | str | None = None,
+) -> list[dict]:
+    """Return per-ship, per-good P&L summary for the last N hours."""
+    cutoff = time.time() - since_hours * 3600
+    params: list = []
+    where = "WHERE timestamp >= ?"
+    params.append(cutoff)
+    if ship_symbol:
+        where += " AND ship_symbol = ?"
+        params.append(ship_symbol)
+    with _conn(path) as con:
+        rows = con.execute(
+            f"""SELECT ship_symbol, trade_symbol, trip_type,
+                       COUNT(*) trips, SUM(units) total_units,
+                       SUM(buy_total) total_cost, SUM(sell_total) total_revenue,
+                       SUM(profit) total_profit,
+                       AVG(profit * 1.0 / NULLIF(buy_total, 0)) avg_roi
+                FROM trade_trips {where}
+                GROUP BY ship_symbol, trade_symbol, trip_type
+                ORDER BY total_profit DESC""",
+            params,
+        ).fetchall()
+    return [
+        {
+            "ship": r[0], "good": r[1], "type": r[2], "trips": r[3],
+            "units": r[4], "cost": r[5], "revenue": r[6],
+            "profit": r[7], "roi": round((r[8] or 0.0) * 100, 1),
+        }
+        for r in rows
+    ]
 
 
 def log_extraction(

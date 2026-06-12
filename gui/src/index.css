@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg:     #050b14;
+  --card:   #0a1628;
+  --border: #1a3050;
+  --cyan:   #00d4ff;
+  --green:  #00ff88;
+  --yellow: #ffd700;
+  --red:    #ff4444;
+  --magenta:#c084fc;
+  --text:   #b8cce4;
+  --bright: #e8f4ff;
+  --dim:    #4a6080;
+  --muted:  #0f2040;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; overflow: hidden; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+  font-size: 13px;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Panels */
+.panel { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow: hidden; }
+.panel-title {
+  color: var(--cyan); font-size: 10px; font-weight: 700; letter-spacing: .12em;
+  text-transform: uppercase; border-bottom: 1px solid var(--border);
+  padding-bottom: 5px; margin-bottom: 8px;
+}
+.panel-title-green { @apply panel-title; color: var(--green); }
+.panel-title-yellow { @apply panel-title; color: var(--yellow); }
+
+/* Tables */
+.data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.data-table th {
+  color: var(--dim); text-align: left; padding: 4px 8px;
+  border-bottom: 1px solid var(--border); white-space: nowrap;
+  position: sticky; top: 0; background: var(--card);
+  font-weight: 600; font-size: 11px; letter-spacing: .05em; z-index: 1;
+}
+.data-table td { padding: 3px 8px; border-bottom: 1px solid #0a1e3a; white-space: nowrap; }
+.data-table tbody tr:hover td { background: var(--muted); cursor: pointer; }
+.data-table tbody tr:nth-child(even) td { background: #0b1c30; }
+.data-table tbody tr:nth-child(even):hover td { background: var(--muted); }
+
+/* Buttons */
+.btn { padding: 4px 11px; font-size: 11px; font-family: inherit; border-radius: 4px; border: 1px solid; cursor: pointer; transition: background .15s; font-weight: 600; }
+.btn-primary { @apply btn; background: #082a50; border-color: var(--cyan); color: var(--cyan); }
+.btn-primary:hover { background: #0a3a70; }
+.btn-default { @apply btn; background: var(--card); border-color: var(--border); color: var(--text); }
+.btn-default:hover { background: var(--muted); }
+.btn-active { @apply btn; background: #082a50; border-color: var(--cyan); color: var(--cyan); }
+.btn-success { @apply btn; background: #0a2e18; border-color: var(--green); color: var(--green); }
+.btn-danger  { @apply btn; background: #2e0a0a; border-color: var(--red);   color: var(--red); }
+.btn:disabled { opacity: .5; cursor: default; }
+
+/* Modal */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.75); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal-box { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; max-width: 700px; width: 100%; max-height: 90vh; overflow-y: auto; box-shadow: 0 0 50px rgba(0,212,255,.15); }
+.modal-title { color: var(--cyan); font-size: 13px; font-weight: 700; letter-spacing: .08em; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+
+/* Tabs */
+.tab-btn { padding: 7px 13px; font-size: 12px; font-family: inherit; border: none; border-bottom: 2px solid transparent; background: transparent; cursor: pointer; color: var(--dim); transition: color .15s; white-space: nowrap; }
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--cyan); border-bottom-color: var(--cyan); background: rgba(0,212,255,.05); }
+
+/* Misc */
+.screen-hint { font-size: 11px; color: var(--dim); padding: 4px 10px; border-bottom: 1px solid var(--border); background: var(--card); flex-shrink: 0; }
+.status-bar  { font-size: 10px; color: var(--dim); padding: 3px 10px; border-top: 1px solid var(--border); background: var(--card); flex-shrink: 0; }
+
+input[type="text"], input[type="search"] {
+  background: var(--muted); border: 1px solid var(--border); color: var(--text);
+  padding: 4px 9px; border-radius: 4px; font-family: inherit; font-size: 12px; outline: none; width: 100%;
+}
+input[type="text"]:focus, input[type="search"]:focus { border-color: var(--cyan); }
+input::placeholder { color: var(--dim); }
+
+/* Progress bar */
+.prog-track { background: var(--muted); border-radius: 3px; height: 5px; }
+.prog-fill  { border-radius: 3px; height: 5px; transition: width .3s; }

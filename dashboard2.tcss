@@ -1,0 +1,347 @@
+/* ── Global ──────────────────────────────────────────────────────────────── */
+Screen {
+    background: #0a0e14;
+    color: #c9d1d9;
+}
+
+Header {
+    background: #0d1117;
+    color: #58a6ff;
+    text-style: bold;
+}
+
+Footer {
+    background: #0d1117;
+}
+
+/* ── Shared ──────────────────────────────────────────────────────────────── */
+.screen-hint {
+    background: #161b22;
+    color: #8b949e;
+    height: 1;
+    padding: 0 1;
+}
+
+.panel-title {
+    background: #1c2128;
+    color: #58a6ff;
+    text-style: bold;
+    height: 1;
+    padding: 0 1;
+}
+
+.panel-title-green {
+    background: #1c2128;
+    color: #3fb950;
+    text-style: bold;
+    height: 1;
+    padding: 0 1;
+}
+
+.panel-title-yellow {
+    background: #1c2128;
+    color: #e3b341;
+    text-style: bold;
+    height: 1;
+    padding: 0 1;
+}
+
+.info-panel {
+    border: solid #21262d;
+    padding: 0 1;
+    overflow-y: auto;
+    height: 1fr;
+}
+
+.status-bar {
+    color: #8b949e;
+    height: 1;
+    padding: 0 1;
+    background: #0d1117;
+}
+
+Button {
+    margin-right: 1;
+}
+
+/* ── DataTable ───────────────────────────────────────────────────────────── */
+DataTable {
+    height: 1fr;
+    background: #0a0e14;
+}
+
+DataTable > .datatable--header {
+    background: #1c2128;
+    color: #58a6ff;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #1f6feb40;
+    color: white;
+}
+
+DataTable > .datatable--hover {
+    background: #1f6feb20;
+}
+
+/* ── TabbedContent ───────────────────────────────────────────────────────── */
+TabbedContent {
+    height: 1fr;
+}
+
+TabPane {
+    padding: 0;
+    height: 1fr;
+}
+
+/* ── Mission Control ─────────────────────────────────────────────────────── */
+#mc-agent-bar {
+    background: #0d1117;
+    color: #c9d1d9;
+    height: 1;
+    padding: 0 1;
+    border-bottom: solid #21262d;
+}
+
+#mc-main {
+    height: 1fr;
+}
+
+#mc-logs-panel {
+    width: 42%;
+    border: solid #21262d;
+    padding: 0;
+}
+
+#mc-logs-title {
+    background: #1c2128;
+    color: #79c0ff;
+    text-style: bold;
+    height: 1;
+    padding: 0 1;
+}
+
+#mc-logs-feed {
+    height: 1fr;
+    padding: 0 1;
+    background: #070a0f;
+}
+
+#mc-fleet-panel {
+    width: 58%;
+    border: solid #21262d;
+    padding: 0;
+}
+
+#mc-fleet-title {
+    background: #1c2128;
+    color: #79c0ff;
+    text-style: bold;
+    height: 1;
+    padding: 0 1;
+}
+
+#mc-fleet-table {
+    height: 1fr;
+    background: #070a0f;
+}
+
+#mc-bottom {
+    height: 18;
+    border-top: solid #21262d;
+}
+
+#mc-contracts-panel {
+    width: 62%;
+    border: solid #21262d;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#mc-stats-panel {
+    width: 38%;
+    border: solid #21262d;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+/* ── Fleet Screen ────────────────────────────────────────────────────────── */
+#fleet2-table {
+    height: 1fr;
+}
+
+/* ── Contracts Screen ────────────────────────────────────────────────────── */
+#contracts2-main {
+    height: 1fr;
+}
+
+#active-contracts-panel {
+    height: 55%;
+    border: solid #21262d;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#available-contracts-panel {
+    height: 45%;
+    border: solid #21262d;
+    padding: 0;
+}
+
+/* ── Transactions/Analytics ──────────────────────────────────────────────── */
+#txn2-filters {
+    height: 3;
+    padding: 0 1;
+    align: left middle;
+}
+
+#txn2-summary {
+    height: 3;
+    padding: 0 1;
+    content-align: left middle;
+    width: 1fr;
+}
+
+#income2-breakdown {
+    padding: 1;
+    overflow-y: auto;
+    height: 1fr;
+}
+
+#yields2-filters {
+    height: 3;
+    padding: 0 1;
+    align: left middle;
+}
+
+/* ── Markets ─────────────────────────────────────────────────────────────── */
+#markets2-main {
+    height: 1fr;
+}
+
+#market2-list-panel {
+    width: 28%;
+    border: solid #21262d;
+}
+
+#market2-detail-panel {
+    width: 72%;
+    border: solid #21262d;
+}
+
+#market2-actions {
+    height: 3;
+    padding: 0 1;
+    align: left middle;
+}
+
+#refresh2-status {
+    height: 3;
+    padding: 0 1;
+    content-align: left middle;
+}
+
+/* ── Map ─────────────────────────────────────────────────────────────────── */
+#map2-main {
+    height: 1fr;
+}
+
+#map2-canvas {
+    width: 1fr;
+    height: 1fr;
+    border: solid #21262d;
+    overflow: hidden;
+    background: #070a0f;
+}
+
+#map2-side {
+    width: 28;
+    height: 1fr;
+    border: solid #21262d;
+    padding: 0 1;
+    overflow-y: auto;
+    background: #0a0e14;
+}
+
+/* ── Universe ────────────────────────────────────────────────────────────── */
+#universe2-filter-bar {
+    height: 3;
+    padding: 0 1;
+}
+
+#universe2-filter {
+    width: 1fr;
+}
+
+#universe2-main {
+    height: 1fr;
+}
+
+#universe2-list-panel {
+    width: 52%;
+    border: solid #21262d;
+}
+
+#universe2-detail-panel {
+    width: 48%;
+    border: solid #21262d;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+/* ── Surveys ─────────────────────────────────────────────────────────────── */
+#surveys2-table {
+    height: 1fr;
+}
+
+/* ── Settings ────────────────────────────────────────────────────────────── */
+#settings2-main {
+    height: 1fr;
+}
+
+#settings2-controls {
+    width: 50%;
+    border: solid #21262d;
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+#settings2-targets {
+    width: 50%;
+    border: solid #21262d;
+    padding: 0;
+}
+
+#settings2-add {
+    height: 7;
+    padding: 1;
+    border-top: solid #21262d;
+}
+
+/* ── Modals ──────────────────────────────────────────────────────────────── */
+ShipDetailModal2, ContractDetailModal2 {
+    align: center middle;
+}
+
+#modal-box2 {
+    background: #161b22;
+    border: solid #388bfd;
+    padding: 1 2;
+    width: 80%;
+    height: 80%;
+}
+
+.modal-title {
+    color: #58a6ff;
+    text-style: bold;
+    background: #0a0e14;
+    height: 1;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#close-btn2 {
+    margin-top: 1;
+    dock: bottom;
+}
