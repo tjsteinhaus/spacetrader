@@ -174,16 +174,16 @@ GOOD_TO_DEPOSIT_TRAITS: dict[str, frozenset[str]] = {
 # Ship purchase priority — week2 plan (higher score = buy first)
 # -1 means never buy; dynamic blocking enforced in ship_score()
 SHIP_SCORES = {
-    "SHIP_SURVEYOR":        100,  # First buy — boosts all miners immediately
-    "SHIP_LIGHT_HAULER":     95,  # Buy all 3 before anything else (big gap enforces order)
+    "SHIP_LIGHT_HAULER":    100,  # First buy — 3 haulers = 2 traders + 1 contract deliverer
     "SHIP_ORE_HOUND":        65,  # Best miner — only after all 3 haulers purchased
     "SHIP_MINING_DRONE":     60,  # Cheap miner — no-drift check required
     "SHIP_SIPHON_DRONE":     55,  # Passive gas — no-drift check required
+    "SHIP_SURVEYOR":         -1,  # Skip — we buy goods from market, don't mine
     "SHIP_HEAVY_FREIGHTER":  -1,  # Never buy
     "SHIP_COMMAND_FRIGATE":  -1,  # Already have one
     "SHIP_GAS_DRONE":        -1,  # Never buy
     "SHIP_LIGHT_SHUTTLE":    -1,  # Never buy — tiny cargo, wrong role
-    "SHIP_PROBE":            -1,  # Never buy
+    "SHIP_PROBE":            -1,  # Never buy (deployed manually via buy_probes.py)
 }
 
 MIN_SELL_PRICE     = 30     # cr/unit — jettison anything below this instead of hauling to market
@@ -3668,11 +3668,11 @@ def ship_score(
     -1 means skip entirely.
 
     Week2 ordering:
-    - Surveyor (100): always buy up to cap — boosts all miners
-    - Light Hauler (95): always buy up to cap — 1 hauler, 2 traders
+    - Light Hauler (100): buy all 3 first — 1 contract deliverer, 2 arbitrage traders
     - Ore Hound (65): only after all 3 haulers purchased
     - Mining Drone (60): after haulers capped + no-drift check
     - Siphon Drone (55): after haulers capped + no-drift check
+    - Surveyor (-1): skipped — strategy is buy-from-market, not mine
     """
     base = SHIP_SCORES.get(ship_type, -1)  # unknown types are skipped
     if base < 0:

@@ -200,16 +200,16 @@ infrastructure (surveyor + haulers) before raw extraction capacity.
 ```python
 # Base scores — Week 2 ordering (higher = buy first; -1 = never buy)
 SHIP_SCORES = {
-    "SHIP_SURVEYOR":        100,  # First buy — boosts all miners immediately
-    "SHIP_LIGHT_HAULER":     95,  # Buy all 3 before anything else (big gap enforces order)
+    "SHIP_LIGHT_HAULER":    100,  # First buy — 3 haulers = 2 traders + 1 contract deliverer
     "SHIP_ORE_HOUND":        65,  # Best miner — only after all 3 haulers purchased
     "SHIP_MINING_DRONE":     60,  # Cheap miner — no-drift check required
     "SHIP_SIPHON_DRONE":     55,  # Passive gas — no-drift check required
+    "SHIP_SURVEYOR":         -1,  # Skip — we buy goods from market, don't mine
     "SHIP_HEAVY_FREIGHTER":  -1,  # Never buy
     "SHIP_COMMAND_FRIGATE":  -1,  # Already have one
     "SHIP_GAS_DRONE":        -1,  # Never buy
     "SHIP_LIGHT_SHUTTLE":    -1,  # Never buy — tiny cargo, wrong role
-    "SHIP_PROBE":            -1,  # Never buy
+    "SHIP_PROBE":            -1,  # Never buy (deployed manually via buy_probes.py)
 }
 ```
 
@@ -217,7 +217,6 @@ SHIP_SCORES = {
 
 | Ship Type | Gate Condition | Effect |
 |---|---|---|
-| `SHIP_SURVEYOR` | surveyors ≥ 1 | → −1 (one surveyor is enough) |
 | `SHIP_LIGHT_HAULER` | haulers ≥ 3 | → −1 (fleet is fully staffed for hauling) |
 | `SHIP_ORE_HOUND` | haulers < 3 | → −1 (must fill all 3 hauler slots first) |
 | `SHIP_ORE_HOUND` | miners ≥ 8 | → `max(base − 30, 10)` (diminishing returns) |
@@ -230,9 +229,9 @@ SHIP_SCORES = {
 
 **No-drift gate (`NO_DRIFT_DIST_MAX = 70`):** `_is_mining_drone_safe()` checks the distance from `ASTEROID` to the nearest fuel market. If > 70 units, small-tank drones would need to DRIFT to refuel — rejecting the purchase until the asteroid routing changes.
 
-**Why surveyor first (score 100)?** A single surveyor running continuously keeps the shared survey pool full so all 3+ miners get focused surveys. Without it, extraction is random — 20+ consecutive cycles with zero contract good is not unusual on the wrong deposit.
+**Why skip the surveyor?** The primary contract strategy is to **buy goods from markets** rather than mine them. Surveyors only benefit miners — if contracts are fulfilled via market purchases, a surveyor adds zero value and wastes ~33k cr that could go toward a hauler.
 
-**Why 3 haulers before more miners (score 95)?** Each miner that leaves the asteroid for a delivery run is a miner not mining. With 3 dedicated haulers, all miners stay at the asteroid continuously. The haulers absorb all cargo transfers via `fleet_api.transfer_cargo()`. At fleet size 4–5 miners, 3 haulers is the sweet spot — more haulers are idle, fewer means miners still deliver.
+**Why 3 haulers first (score 100)?** Each hauler runs as a trader (buy-low/sell-high arbitrage) when not delivering contracts. Hauler #1 = contract deliverer, Hauler #2 and #3 = arbitrage traders generating 200–500k cr/hour. Getting all 3 online as fast as possible is the fastest path to the ~1M credit threshold for Stage 3.
 
 **Buy-list DB override:** The dashboard can set `ship_buy_list` in the bot_settings DB table to override the hardcoded SHIP_SCORES. Format: `[{"type": "SHIP_SURVEYOR", "max": 1}, ...]`. Empty list = use hardcoded defaults.
 
