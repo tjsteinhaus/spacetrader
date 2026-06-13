@@ -30,6 +30,11 @@ class ContractContext:
     units_fulfilled: int
     done: asyncio.Event      # set when contract is fulfilled
     fulfill_lock: asyncio.Lock  # prevents double-fulfillment
+    # Ships that must buy (not mine) the contract good.
+    # Set by the orchestrator when a direct-buy contract is detected.
+    forced_buyer_ships: frozenset[str] = frozenset()
+    # Ships running in mine-only/sell-only mode (don't try to deliver).
+    mine_only_ships: frozenset[str] = frozenset()
 
 
 class BaseRole(ABC):

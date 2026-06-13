@@ -131,6 +131,12 @@ class AsteroidCache:
             else:
                 s -= min(150.0, dist_from_ship * 0.10)
 
+            # First-trip drift penalty: ship burns dist_from_ship getting here
+            # then needs base_dist to return.  If that exceeds the fuel tank the
+            # ship will be forced to drift home on the very first trip.
+            if fuel_cap > 0 and (dist_from_ship + ast["base_dist"]) > fuel_cap:
+                s -= 60.0
+
             # Penalize by distance to delivery waypoint — closer = faster cycle time.
             del_x, del_y = self._coords.get(delivery_wp, (0, 0))
             dist_to_delivery = ((ast["x"] - del_x) ** 2 + (ast["y"] - del_y) ** 2) ** 0.5
@@ -144,6 +150,9 @@ class AsteroidCache:
 
 # Module-level cache shared across all miners in the same run
 _asteroid_cache = AsteroidCache()
+
+# Tracks which asteroid active miners chose — surveyor follows this.
+_active_mining_wp: str = ""
 
 
 class MinerRole(BaseRole):
@@ -183,6 +192,10 @@ class MinerRole(BaseRole):
         use_shared_surveys = True
         self.log.info("Mining target: %s", mining_target)
 
+        # Publish the chosen asteroid so surveyors can follow.
+        global _active_mining_wp
+        _active_mining_wp = mining_target
+
         # Preflight refuel
         wp0 = ship["nav"]["waypointSymbol"]
         f0 = ship.get("fuel", {})
@@ -209,19 +222,33 @@ class MinerRole(BaseRole):
         is_mineable = good in MINEABLE_GOODS
         no_deposit = is_mineable and not db.can_be_mined(good, self._cfg.system)
 
+        # Forced buyer: the orchestrator assigned this ship to buy (not mine) the contract good.
+        forced_buyer = self.ship_symbol in (ctx.forced_buyer_ships if ctx else frozenset())
+        mine_only    = self.ship_symbol in (ctx.mine_only_ships    if ctx else frozenset())
+
         direct_buy = bool(
             buy_wp
             and (
                 not is_mineable
                 or no_deposit
                 or (buy_price > 0 and buy_price <= self._cfg.cheap_buy_threshold)
+                or forced_buyer
             )
         )
 
+        if mine_only:
+            # This ship mines for income; it never delivers the contract good directly.
+            direct_buy = False
+
         if direct_buy:
-            reason = "no deposit" if no_deposit else "cheap" if is_mineable else "non-mineable"
+            reason = (
+                "forced buyer" if forced_buyer and is_mineable and not no_deposit
+                else "no deposit" if no_deposit
+                else "cheap" if is_mineable
+                else "non-mineable"
+            )
             self.log.info("%s: direct-buy mode (%s @ %d cr/u)", good, reason, buy_price)
-            if (no_deposit or not is_mineable) and buy_wp:
+            if (no_deposit or not is_mineable or forced_buyer) and buy_wp:
                 # Check reachability before committing to a distant buy market
                 _db_ship = await self._get_ship()
                 _db_cur = _db_ship["nav"]["waypointSymbol"]
@@ -480,7 +507,13 @@ class MinerRole(BaseRole):
                 req = dt["unitsRequired"]
                 ctx.units_fulfilled = f
                 ctx.units_required = req
+                delivered_this_trip = f - getattr(ctx, "_last_fulfilled", 0)
+                setattr(ctx, "_last_fulfilled", f)
                 self.log.info("%d/%d %s delivered", f, req, good)
+                try:
+                    db.record_delivery(cid, good, self.ship_symbol, delivered_this_trip, f, req)
+                except Exception:
+                    pass
                 # Update DB so dashboard reflects live progress
                 try:
                     import db as _db
@@ -493,7 +526,12 @@ class MinerRole(BaseRole):
                             try:
                                 res = await contracts_api.fulfill_contract(self._client, cid)
                                 ag = res.get("agent", {})
-                                self.log.info("Contract fulfilled! Credits: %d", ag.get("credits", 0))
+                                credits_now = ag.get("credits", 0)
+                                self.log.info("Contract fulfilled! Credits: %d", credits_now)
+                                try:
+                                    db.record_credits(credits_now)
+                                except Exception:
+                                    pass
                             except SpaceTradersError as e:
                                 self.log.warning("Fulfill error: %s", e)
                             ctx.done.set()
@@ -526,6 +564,19 @@ class MinerRole(BaseRole):
 
         await self._navigate_with_refuel(buy_wp)
         await self._ensure_docked()
+
+        # Sell any junk cargo before buying so all slots are free for the contract good.
+        junk_ship = await self._get_ship()
+        has_junk = any(
+            i["symbol"] != good and i.get("units", 0) > 0
+            for i in junk_ship["cargo"].get("inventory", [])
+        )
+        if has_junk:
+            await self.sell_junk(keep_good=good)
+            # Refuel after junk run in case we moved to sell
+            await self._navigate_with_refuel(buy_wp)
+            await self._ensure_docked()
+
         buy_price = await self._market.get_buy_price(buy_wp, good)
         if buy_price <= 0:
             # Force cache refresh while docked
