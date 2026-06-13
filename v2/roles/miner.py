@@ -13,6 +13,7 @@ from client import SpaceTradersError
 from api import fleet as fleet_api, contracts as contracts_api, agent as agent_api
 from constants import MINEABLE_GOODS, GOOD_TO_DEPOSIT_TRAITS, ASTEROID_TRAIT_SCORES, ASTEROID_TYPES
 import db
+import groups
 from .base import BaseRole
 
 if TYPE_CHECKING:
@@ -331,6 +332,17 @@ class MinerRole(BaseRole):
             )
 
             if loop_space < 5 or (have_cached > 0 and not at_asteroid) or skip_to_buy or force_buy:
+                # ── Grouped mode: cargo full → signal hauler and wait ─────────
+                if loop_space < 5 and not direct_buy and groups.is_grouped_worker(self.ship_symbol):
+                    evt = groups.get_worker_event(self.ship_symbol)
+                    if evt is not None:
+                        evt.set()
+                        self.log.info("Cargo full — waiting for hauler pickup")
+                        while not stop.is_set() and evt.is_set():
+                            await asyncio.sleep(10)
+                        # Hauler cleared the event — resume mining
+                        continue
+
                 if have_cached > 0 and not ctx.done.is_set():
                     if not direct_buy:
                         empty_loads = 0

@@ -1,5 +1,8 @@
 """
 roles/siphoner.py — SiphonerRole: siphons gas from gas giants, sells proceeds.
+
+When part of a siphon group (registered in groups.py), the siphoner signals
+its hauler instead of self-selling — the hauler comes to collect the cargo.
 """
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ from client import SpaceTradersError
 from api import fleet as fleet_api
 from api import contracts as contracts_api
 import db
+import groups
 from .base import BaseRole
 
 
@@ -50,11 +54,42 @@ class SiphonerRole(BaseRole):
             await self._nav.wait_cooldown(self.ship_symbol)
             ship = await self._get_ship()
             cargo = ship.get("cargo", {})
+
+            # Jettison worthless goods so they don't clog the hold
+            for item in cargo.get("inventory", []):
+                sym = item["symbol"]
+                best_price = max(
+                    (
+                        (await self._market.get_prices(wp)).get(sym, 0)
+                        for wp in (self._market.known_markets or [self._cfg.asteroid_base])
+                    ),
+                    default=0,
+                )
+                if best_price < 30:
+                    try:
+                        await fleet_api.jettison(self._client, self.ship_symbol, sym, item["units"])
+                        self.log.info("Jettisoned %dx %s (%d cr/u)", item["units"], sym, best_price)
+                    except SpaceTradersError:
+                        pass
+            # Re-fetch cargo after jettison
+            ship = await self._get_ship()
+            cargo = ship.get("cargo", {})
+
             if cargo.get("units", 0) >= cargo.get("capacity", 1):
+                # ── Grouped mode: signal hauler and wait for pickup ────────
+                evt = groups.get_worker_event(self.ship_symbol)
+                if evt is not None:
+                    evt.set()
+                    self.log.info("Cargo full — waiting for hauler pickup")
+                    while not stop.is_set() and evt.is_set():
+                        await asyncio.sleep(10)
+                    # Hauler cleared the event — resume siphoning
+                    continue
+
+                # ── Solo mode: self-sell ──────────────────────────────────
                 ctx = self._ctx
                 contract_good = ctx.trade_symbol if ctx and not ctx.done.is_set() else None
                 await self.sell_junk(keep_good=contract_good)
-                # Deliver contract good if we have any
                 if contract_good:
                     ship_now = await self._get_ship()
                     have = sum(
@@ -81,8 +116,6 @@ class SiphonerRole(BaseRole):
                                         ctx.done.set()
                         except SpaceTradersError as e:
                             self.log.warning("Delivery error: %s", e)
-                # Always refuel at base before heading back to gas giant
-                # to avoid drifting through empty space with no refuel stops.
                 await self._navigate_with_refuel(self._cfg.asteroid_base)
                 await self._ensure_docked()
                 await self._refuel()

@@ -33,9 +33,12 @@ from roles.hauler import HaulerRole
 from roles.trader import TraderRole
 from roles.explorer import ExplorerRole
 from roles.siphoner import SiphonerRole
+from roles.siphon_hauler import SiphonHaulerRole
+from roles.miner_hauler import MinerHaulerRole
 from roles.fleet_manager import FleetManagerRole
 import db
 import discord_notify as discord
+import groups
 
 if TYPE_CHECKING:
     pass
@@ -282,10 +285,28 @@ class Orchestrator:
             return
 
         log.info("[ASSIGN] got %d ships", len(ships))
+        fleet_syms = {s["symbol"] for s in ships}
 
-        # ── Direct-buy contract detection ─────────────────────────────
+        # ── Load and validate ship groups ────────────────────────────────────
+        raw_groups = await groups.auto_group_ships(self._client, self._cfg)
+        active_groups = groups.validate_groups(raw_groups, fleet_syms)
+        groups.clear_all_events()
+
+        grouped_haulers: set[str] = set()
+        grouped_workers: set[str] = set()
+        all_worker_syms: list[str] = []
+        for grp in active_groups:
+            grouped_haulers.add(grp["hauler"])
+            grouped_workers.update(grp["workers"])
+            all_worker_syms.extend(grp["workers"])
+            log.info("Group '%s': hauler=%s workers=%s", grp["name"], grp["hauler"], grp["workers"])
+
+        groups.init_worker_events(all_worker_syms)
+
+        # ── Direct-buy contract detection ──────────────────────────────────
         # If the contract good can be bought directly from a market, assign
         # roles the same way as v1: one dedicated buyer, rest mine for income.
+        # Group-assigned ships are excluded from the free pool.
         contract_good = ""
         if contract:
             deliver = (contract.get("terms", {}).get("deliver") or [{}])[0]
@@ -295,41 +316,67 @@ class Orchestrator:
         is_direct_buy_contract = bool(buy_wp)
 
         if is_direct_buy_contract:
-            miners  = [s["symbol"] for s in ships
-                       if any("MINING" in m.get("symbol", "") for m in s.get("mounts", []))]
-            haulers = [s["symbol"] for s in ships
-                       if s.get("registration", {}).get("role", "") in ("HAULER", "TRANSPORT")
-                       and s["symbol"] != self._cfg.fleet_manager_ship]
+            free_miners  = [s["symbol"] for s in ships
+                            if any("MINING" in m.get("symbol", "") for m in s.get("mounts", []))
+                            and s["symbol"] not in grouped_workers
+                            and s["symbol"] not in grouped_haulers]
+            free_haulers = [s["symbol"] for s in ships
+                            if s.get("registration", {}).get("role", "") in ("HAULER", "TRANSPORT")
+                            and s["symbol"] != self._cfg.fleet_manager_ship
+                            and s["symbol"] not in grouped_haulers
+                            and s["symbol"] not in grouped_workers]
 
-            if len(haulers) >= 2:
-                # First hauler buys + delivers; rest trade for income; all miners mine + sell
-                forced_buyer_ships = frozenset([haulers[0]])
-                mine_only_ships    = frozenset(miners)
-                trader_ships       = set(haulers[1:])
+            if len(free_haulers) >= 2:
+                forced_buyer_ships = frozenset([free_haulers[0]])
+                mine_only_ships    = frozenset(free_miners)
+                trader_ships       = set(free_haulers[1:])
                 log.info("[ASSIGN] direct-buy: hauler %s buys/delivers; %d miner(s) mine; %d hauler(s) trade",
-                         haulers[0], len(miners), len(haulers) - 1)
-            elif haulers:
-                # 1 hauler → let it trade; first miner is the forced buyer
-                forced_buyer_ships = frozenset([miners[0]]) if miners else frozenset()
-                mine_only_ships    = frozenset(miners[1:]) if len(miners) > 1 else frozenset()
-                trader_ships       = set(haulers)
+                         free_haulers[0], len(free_miners), len(free_haulers) - 1)
+            elif free_haulers:
+                forced_buyer_ships = frozenset([free_miners[0]]) if free_miners else frozenset()
+                mine_only_ships    = frozenset(free_miners[1:]) if len(free_miners) > 1 else frozenset()
+                trader_ships       = set(free_haulers)
                 log.info("[ASSIGN] direct-buy: miner %s buys/delivers; hauler %s trades; %d other miner(s) mine",
-                         (miners[0] if miners else "none"), haulers[0], max(0, len(miners) - 1))
+                         (free_miners[0] if free_miners else "none"), free_haulers[0], max(0, len(free_miners) - 1))
             else:
-                # No hauler — first miner buys, rest mine
-                forced_buyer_ships = frozenset([miners[0]]) if miners else frozenset()
-                mine_only_ships    = frozenset(miners[1:]) if len(miners) > 1 else frozenset()
+                forced_buyer_ships = frozenset([free_miners[0]]) if free_miners else frozenset()
+                mine_only_ships    = frozenset(free_miners[1:]) if len(free_miners) > 1 else frozenset()
                 trader_ships: set[str] = set()
                 log.info("[ASSIGN] direct-buy: miner %s buys/delivers; %d other miner(s) mine",
-                         (miners[0] if miners else "none"), max(0, len(miners) - 1))
+                         (free_miners[0] if free_miners else "none"), max(0, len(free_miners) - 1))
 
             ctx.forced_buyer_ships = forced_buyer_ships
             ctx.mine_only_ships    = mine_only_ships
         else:
             trader_ships = set()
 
+        # ── Launch group hauler tasks ─────────────────────────────────────────
+        _role_kwargs = dict(
+            config=self._cfg,
+            client=self._client,
+            navigator=self._nav,
+            market=self._market,
+            surveys=self._surveys,
+        )
+        for grp in active_groups:
+            grp_type    = grp["type"]
+            grp_hauler  = grp["hauler"]
+            grp_workers = grp["workers"]
+            if grp_type == "siphon":
+                role = SiphonHaulerRole(workers=grp_workers, ship_symbol=grp_hauler, **_role_kwargs)
+            else:
+                role = MinerHaulerRole(workers=grp_workers, ship_symbol=grp_hauler, **_role_kwargs)
+            task = asyncio.create_task(role.run(self._stop), name=f"{grp_hauler}:group_{grp_type}_hauler")
+            self._active_tasks[grp_hauler] = task
+            log.info("%s → group_%s_hauler (workers: %s)", grp_hauler, grp_type, grp_workers)
+
+        # ── Launch individual ship tasks (skip group haulers) ─────────────────
         for ship in ships:
             sym = ship["symbol"]
+
+            # Group haulers already have their task
+            if sym in grouped_haulers:
+                continue
 
             # Override role for trader ships in direct-buy mode
             if is_direct_buy_contract and sym in trader_ships:
