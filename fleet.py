@@ -50,10 +50,12 @@ def patch_nav(symbol: str, flight_mode: str) -> dict:
 
 # --- Fuel & Cargo ---
 
-def refuel(symbol: str, units: int | None = None) -> dict:
-    body = {}
+def refuel(symbol: str, units: int | None = None, from_cargo: bool = False) -> dict:
+    body: dict = {}
     if units is not None:
         body["units"] = units
+    if from_cargo:
+        body["fromCargo"] = True
     return client.post(f"/my/ships/{symbol}/refuel", body)
 
 
