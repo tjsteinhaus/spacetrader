@@ -4256,7 +4256,7 @@ def _print_status_table(contract: dict | None = None) -> None:
 
 def work_contract(contract: dict) -> None:
     """Accept (if needed) then run all miners in parallel until contract is fulfilled."""
-    global _active_contract
+    global _active_contract, _ship_groups
     _contract_buy_ships.clear()  # reset per-contract buy assignments
     with _active_contract_lock:
         _active_contract = contract
@@ -4411,7 +4411,6 @@ def work_contract(contract: dict) -> None:
         log(f"[blue]Launching {len(siphoners)} siphoner thread(s): {siphoners}[/blue]")
 
     # ── Load ship groups and remove group-assigned ships from normal pools ────
-    global _ship_groups
     # Groups were already loaded above (pre-grouping); just clear worker events.
     # _ship_groups is already set from the pre-grouping step above.
     _group_worker_ready.clear()
