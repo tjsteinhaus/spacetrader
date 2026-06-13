@@ -288,21 +288,24 @@ GOOD_TO_DEPOSIT_TRAITS: dict[str, frozenset[str]] = {
 # Ship purchase priority — higher score = buy first.
 # -1 means never buy; dynamic gating enforced in ship_score().
 SHIP_SCORES = {
-    "SHIP_LIGHT_HAULER":   100,  # Seed new teams — always first priority
-    "SHIP_ORE_HOUND":       65,  # Best miner — fill miner team slots
+    "SHIP_LIGHT_HAULER":   100,  # Seed new teams + traders — always first priority
     "SHIP_MINING_DRONE":    60,  # Cheap miner — fill miner team slots (drift-safe check)
     "SHIP_SIPHON_DRONE":    55,  # Gas siphoner — fill siphon team slots
+    "SHIP_PROBE":           20,  # Scout/charter — buy when wealthy (>1M cr), explore all systems
+    "SHIP_ORE_HOUND":       15,  # Miner — lower priority until groups prove out
     "SHIP_SURVEYOR":        -1,  # Never buy
     "SHIP_HEAVY_FREIGHTER": -1,  # Never buy
     "SHIP_COMMAND_FRIGATE": -1,  # Already have one
     "SHIP_GAS_DRONE":       -1,  # Never buy
     "SHIP_LIGHT_SHUTTLE":   -1,  # Never buy
-    "SHIP_PROBE":           -1,  # Never buy
 }
 
 # ── Team composition targets (hardcoded) ────────────────────────────────────────────
 PRODUCERS_PER_TEAM_TARGET = 5   # workers to fill one team before seeding a new one
 HAULERS_PER_TEAM_TARGET   = 1   # haulers per active team (currently always 1)
+MAX_TRADERS               = 3   # free (non-group) haulers dedicated to arbitrage
+PROBE_CREDIT_THRESHOLD    = 1_000_000  # don't buy probes until we have this many credits
+MAX_PROBES                = 10  # max probe fleet (one per reachable system)
 MAX_SIPHON_TEAMS          = 2   # maximum concurrent siphon teams
 MAX_MINER_TEAMS           = 2   # maximum concurrent miner teams
 
@@ -3720,7 +3723,7 @@ def _bg_buy_and_launch(
     _KNOWN_SHIP_TYPES = [
         "SHIP_ORE_HOUND", "SHIP_MINING_DRONE", "SHIP_COMMAND_FRIGATE",
         "SHIP_SURVEYOR", "SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER",
-        "SHIP_SIPHON_DRONE",
+        "SHIP_SIPHON_DRONE", "SHIP_PROBE",
     ]
     _eligible_types = set(t for t in _KNOWN_SHIP_TYPES if _should_buy(t))
     if not _eligible_types:
@@ -3814,6 +3817,10 @@ def _bg_buy_and_launch(
                     _siphoner_symbols.append(new_symbol)
                     loop_target  = siphon_loop
                     thread_label = "siphoner"
+                elif ship_type == "SHIP_PROBE" or new_ship_data["frame"].get("symbol") == "FRAME_PROBE":
+                    _explorer_symbols.append(new_symbol)
+                    loop_target  = explorer_loop
+                    thread_label = "explorer"
                 elif has_survey_mount(new_ship_data) and not has_mining_mount(new_ship_data):
                     loop_target  = surveyor_loop
                     thread_label = "surveyor"
@@ -3930,6 +3937,7 @@ def _bg_scan_next_market() -> None:
         _KNOWN_SHIP_TYPES = [
             "SHIP_ORE_HOUND", "SHIP_MINING_DRONE", "SHIP_COMMAND_FRIGATE",
             "SHIP_SURVEYOR", "SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER",
+            "SHIP_SIPHON_DRONE", "SHIP_PROBE",
         ]
         _eligible = set(t for t in _KNOWN_SHIP_TYPES if _scan_should_buy(t))
         if _eligible:
@@ -4211,7 +4219,7 @@ def _print_status_table(contract: dict | None = None) -> None:
             "surveyor":      f"🔭 Surveyor",
             "trader":        f"💹 Trader",
             "hauler":        f"🚢 Hauler",
-            "explorer":      f"🛸 Explorer",
+            "explorer":      f"🌌 Explorer",
             "command":       f"👑 Command",
         }
         display_name = _friendly.get(role_label, role_label.title())
@@ -4694,8 +4702,34 @@ def ship_score(
         need_miner_hauler = (
             n_miner_teams == 0 or (m_all_full and n_miner_teams < MAX_MINER_TEAMS)
         )
-        if not need_siphon_hauler and not need_miner_hauler:
-            log("[dim]Fleet manager: hauler skipped — all teams full and at cap[/dim]")
+        # Also buy haulers for trading until we reach MAX_TRADERS free haulers
+        with _ship_groups_lock:
+            _grouped_h = {g.get("hauler") for g in _ship_groups}
+        all_haulers = fleet_api.get_my_ships()
+        free_haulers = sum(
+            1 for s in all_haulers
+            if s["registration"]["role"] in ("HAULER", "TRANSPORT")
+            and s["symbol"] not in _grouped_h
+            and s["symbol"] != FLEET_MANAGER_SHIP
+        )
+        need_trader = free_haulers < MAX_TRADERS
+        if not need_siphon_hauler and not need_miner_hauler and not need_trader:
+            log("[dim]Fleet manager: hauler skipped — all teams full, at cap, and traders at max[/dim]")
+            return -1
+        return base
+
+    if ship_type == "SHIP_PROBE":
+        # Only buy probes when comfortably wealthy and under the probe cap
+        try:
+            me = agent_api.get_my_agent()
+            credits = me.get("credits", 0)
+        except Exception:
+            return -1
+        if credits < PROBE_CREDIT_THRESHOLD:
+            return -1
+        all_ships = fleet_api.get_my_ships()
+        probe_count = sum(1 for s in all_ships if s["frame"].get("symbol") == "FRAME_PROBE")
+        if probe_count >= MAX_PROBES:
             return -1
         return base
 
