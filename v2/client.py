@@ -40,24 +40,29 @@ def _get_rate_lock() -> asyncio.Lock:
 
 
 async def _rate_limit() -> None:
-    """Consume one token from the bucket, sleeping if the bucket is empty."""
-    global _RATE_TOKENS, _RATE_LAST_TS
-    lock = _get_rate_lock()
-    async with lock:
-        now = time.monotonic()
-        if _RATE_LAST_TS == 0.0:
-            _RATE_LAST_TS = now
-        elapsed = now - _RATE_LAST_TS
-        _RATE_TOKENS = min(_RATE_CAPACITY, _RATE_TOKENS + elapsed * _RATE_REFILL)
-        _RATE_LAST_TS = now
+    """Consume one token from the bucket, sleeping OUTSIDE the lock if the bucket is empty.
 
-        if _RATE_TOKENS < 1.0:
+    The original implementation slept while holding the lock, which caused all
+    concurrent tasks to queue up behind it and starved the event loop — the bot
+    would appear to start then silently freeze with no log output.
+    """
+    global _RATE_TOKENS, _RATE_LAST_TS
+    while True:
+        lock = _get_rate_lock()
+        async with lock:
+            now = time.monotonic()
+            if _RATE_LAST_TS == 0.0:
+                _RATE_LAST_TS = now
+            elapsed = now - _RATE_LAST_TS
+            _RATE_TOKENS = min(_RATE_CAPACITY, _RATE_TOKENS + elapsed * _RATE_REFILL)
+            _RATE_LAST_TS = now
+
+            if _RATE_TOKENS >= 1.0:
+                _RATE_TOKENS -= 1.0
+                return  # got a token — done
             wait = (1.0 - _RATE_TOKENS) / _RATE_REFILL
-            await asyncio.sleep(wait)
-            _RATE_TOKENS = 0.0
-            _RATE_LAST_TS = time.monotonic()
-        else:
-            _RATE_TOKENS -= 1.0
+        # Lock is released before sleeping so other tasks can check their state
+        await asyncio.sleep(wait)
 
 
 class SpaceTradersError(Exception):
