@@ -358,8 +358,13 @@ class Navigator:
             # No fuel market can bridge the gap — try a CRUISE hop to any
             # waypoint that makes geometric progress before drifting the rest.
             # CRUISE is ~3× faster than DRIFT so even one hop helps significantly.
+            # Only use a waypoint as a cruise hop if:
+            #   (a) it's a fuel market (we can refuel and continue), OR
+            #   (b) the destination is directly reachable from it at full tank.
+            # Hopping to a dead-end non-fuel waypoint just shifts where we drift.
             best_cruise_wp: str | None = None
             best_cruise_remaining = dist_to_dest
+            fuel_market_set = set(self._market.exporters("FUEL"))
             for wp, (wx, wy) in list(self._coords.items()):
                 if wp == cur_wp or wp in visited:
                     continue
@@ -367,6 +372,9 @@ class Navigator:
                 if hop_dist > cur_fuel:
                     continue  # can't reach in CRUISE with current fuel
                 remaining = ((dx - wx) ** 2 + (dy - wy) ** 2) ** 0.5
+                # Skip non-fuel waypoints from which the destination is still out of range
+                if wp not in fuel_market_set and remaining > fuel_cap:
+                    continue
                 if remaining < best_cruise_remaining:
                     best_cruise_remaining = remaining
                     best_cruise_wp = wp

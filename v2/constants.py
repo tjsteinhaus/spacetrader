@@ -65,18 +65,25 @@ ASTEROID_TRAIT_SCORES: dict[str, int] = {
 }
 
 # Ship purchase priority (higher score = buy first; -1 = never buy).
+# Dynamic safety checks in fleet_manager override positive scores when
+# the asteroid or gas giant is too far from any fuel market.
 SHIP_SCORES: dict[str, int] = {
-    "SHIP_ORE_HOUND":       -1,
-    "SHIP_MINING_DRONE":    -1,
-    "SHIP_SURVEYOR":        -1,
-    "SHIP_LIGHT_HAULER":    -1,
-    "SHIP_HEAVY_FREIGHTER": -1,
-    "SHIP_COMMAND_FRIGATE": -1,
-    "SHIP_SIPHON_DRONE":    -1,
-    "SHIP_GAS_DRONE":       -1,
-    "SHIP_LIGHT_SHUTTLE":   -1,
-    "SHIP_PROBE":           -1,
+    "SHIP_LIGHT_HAULER":    100,  # First buy — seed arbitrage; needed before miners
+    "SHIP_ORE_HOUND":        65,  # Best miner — only after hauler(s) purchased
+    "SHIP_MINING_DRONE":     60,  # Cheap miner — no-drift check required
+    "SHIP_SIPHON_DRONE":     55,  # Passive gas — no-drift check required
+    "SHIP_SURVEYOR":         -1,  # Skip — buy goods from market, don't mine
+    "SHIP_HEAVY_FREIGHTER":  -1,  # Never buy
+    "SHIP_COMMAND_FRIGATE":  -1,  # Already have one
+    "SHIP_GAS_DRONE":        -1,  # Never buy
+    "SHIP_LIGHT_SHUTTLE":    -1,  # Never buy — tiny cargo, wrong role
+    "SHIP_PROBE":            -1,  # Never buy (deployed manually)
 }
+
+# Maximum distance from a fuel market for mining/siphon drones to be considered
+# safe to deploy. Ships with small fuel tanks (80u) can't cruise home if the
+# asteroid/gas-giant is more than this many units from the nearest fuel stop.
+NO_DRIFT_DIST_MAX: int = 70
 
 # Mining laser tiers, weakest → strongest.
 MINING_MOUNT_TIERS: list[str] = [
