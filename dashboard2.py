@@ -34,7 +34,7 @@ from textual.binding import Binding
 from textual.screen import Screen, ModalScreen
 from textual.widgets import (
     Header, Footer, DataTable, Label, Static,
-    TabbedContent, TabPane, Button, Input, RichLog,
+    TabbedContent, TabPane, Button, Input, RichLog, Select,
 )
 from textual.containers import Container, Horizontal, Vertical
 from textual import work, on, events
@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import db
 import agent as agent_api
+import contracts as contracts_api
 import fleet as fleet_api
 import universe as universe_api
 from client import SpaceTradersError
@@ -197,6 +198,26 @@ def _system_from_wp(waypoint: str) -> str:
     return "-".join(parts[:2]) if len(parts) >= 3 else SYSTEM
 
 
+def _ship_role_label(ship: dict) -> str:
+    """Return a display label like 'TYLERDEVRUN-8  [siphoner]' for use in dropdowns."""
+    sym = ship.get("symbol", "?")
+    mounts = [m.get("symbol", "") for m in ship.get("mounts", [])]
+    frame_sym = ship.get("frame", {}).get("symbol", "")
+    if any("GAS_SIPHON" in m for m in mounts):
+        role = "siphoner"
+    elif any("MINING_LASER" in m for m in mounts):
+        role = "miner"
+    elif any("SURVEYING" in m for m in mounts):
+        role = "surveyor"
+    elif "LIGHT_HAULER" in frame_sym or "HEAVY_FREIGHTER" in frame_sym:
+        role = "hauler"
+    elif "COMMAND" in frame_sym:
+        role = "command"
+    else:
+        role = frame_sym.removeprefix("FRAME_").replace("_", " ").title().lower()
+    return f"{sym}  [{role}]"
+
+
 def _calc_cph() -> tuple[int, int]:
     now = time.time()
     try:
@@ -344,6 +365,7 @@ def _render_map(
 _BUYABLE_SHIP_TYPES = [
     "SHIP_ORE_HOUND",
     "SHIP_MINING_DRONE",
+    "SHIP_SIPHON_DRONE",
     "SHIP_SURVEYOR",
     "SHIP_LIGHT_HAULER",
     "SHIP_HEAVY_FREIGHTER",
@@ -360,8 +382,34 @@ class ShipDetailModal2(ModalScreen[None]):
         super().__init__()
         self._ship = ship
 
+    def _is_queued_for_scrap(self) -> bool:
+        raw = db.get_bot_setting("pending_scrap", "[]")
+        try:
+            return self._ship.get("symbol", "") in __import__("json").loads(raw)
+        except Exception:
+            return False
+
+    def _get_groups(self) -> list[dict]:
+        try:
+            return json.loads(db.get_bot_setting("ship_groups", "[]"))
+        except Exception:
+            return []
+
+    def _get_my_group_info(self) -> tuple[str | None, str | None]:
+        """Returns (role, hauler_or_None) where role is 'hauler', 'worker', or None."""
+        sym = self._ship.get("symbol", "")
+        for grp in self._get_groups():
+            if grp.get("hauler") == sym:
+                return "hauler", None
+            if sym in grp.get("workers", []):
+                return "worker", grp.get("hauler")
+        return None, None
+
     def compose(self) -> ComposeResult:
         sym = self._ship.get("symbol", "?")
+        queued = self._is_queued_for_scrap()
+        scrap_label = "✅ Cancel Scrap" if queued else "🗑  Queue for Scrap"
+        scrap_variant = "warning" if queued else "error"
         with Container(id="modal-box2"):
             yield Label(f" {sym} — Ship Detail ", classes="modal-title")
             with TabbedContent():
@@ -371,7 +419,12 @@ class ShipDetailModal2(ModalScreen[None]):
                     yield DataTable(id="cargo-table2", show_cursor=False, zebra_stripes=True)
                 with TabPane("Mounts & Modules"):
                     yield DataTable(id="mounts-table2", show_cursor=False, zebra_stripes=True)
-            yield Button("Close  [Esc]", id="close-btn2", variant="default")
+                with TabPane("Group"):
+                    yield Static(id="ship-group-info2")
+                    yield Label("[dim]To change group assignment, use Fleet → Groups tab.[/dim]", classes="dim")
+            with Horizontal(id="ship-modal-actions"):
+                yield Button(scrap_label, id="scrap-btn2", variant=scrap_variant)
+                yield Button("Close  [Esc]", id="close-btn2", variant="default")
 
     def on_mount(self) -> None:
         ship    = self._ship
@@ -431,6 +484,72 @@ class ShipDetailModal2(ModalScreen[None]):
             mt.add_row(Text(mod.get("symbol","?"), style="yellow"), mod.get("name","?"), "—", "module")
         if not ship.get("mounts") and not ship.get("modules"):
             mt.add_row(Text("None", style="dim"), "", "", "")
+
+        # ── Group tab ──
+        self._refresh_group_tab()
+
+    def _refresh_group_tab(self) -> None:
+        sym    = self._ship.get("symbol", "")
+        groups = self._get_groups()
+        role, hauler = self._get_my_group_info()
+        lines: list[str] = ["[bold cyan]── Current Group Assignment ──[/bold cyan]", ""]
+        if role == "hauler":
+            grp = next((g for g in groups if g.get("hauler") == sym), None)
+            workers = grp.get("workers", []) if grp else []
+            gtype   = grp.get("type", "?") if grp else "?"
+            gname   = grp.get("name", "") if grp else ""
+            lines += [
+                f"  Group:    [bold]{gname}[/bold]" if gname else "",
+                f"  Role:     [green]Hauler[/green]",
+                f"  Type:     [cyan]{gtype}[/cyan]",
+                f"  Workers:  {', '.join(workers) if workers else '[dim]none[/dim]'}",
+            ]
+        elif role == "worker":
+            grp = next((g for g in groups if sym in g.get("workers", [])), None)
+            gname = grp.get("name", "") if grp else ""
+            gtype = grp.get("type", "?") if grp else "?"
+            lines += [
+                f"  Group:    [bold]{gname}[/bold]" if gname else "",
+                f"  Role:     [yellow]Worker[/yellow]",
+                f"  Type:     [cyan]{gtype}[/cyan]",
+                f"  Hauler:   [green]{hauler}[/green]",
+            ]
+        else:
+            lines += ["  [dim]Not assigned to any group[/dim]"]
+        lines += ["", "[bold cyan]── All Groups ──[/bold cyan]", ""]
+        if groups:
+            for g in groups:
+                gname = g.get("name", "")
+                icon  = "⛽" if g.get("type") == "siphon" else "⛏"
+                lines.append(
+                    f"  {icon} [bold]{gname}[/bold]  "
+                    f"[green]{g.get('hauler','—')}[/green] ← {', '.join(g.get('workers', []))}"
+                )
+        else:
+            lines.append("  [dim]No groups configured[/dim]")
+        self.query_one("#ship-group-info2", Static).update("\n".join(l for l in lines if l != ""))
+
+    @on(Button.Pressed, "#scrap-btn2")
+    def _toggle_scrap(self) -> None:
+        import json as _json
+        sym = self._ship.get("symbol", "")
+        raw = db.get_bot_setting("pending_scrap", "[]")
+        try:
+            queue: list[str] = _json.loads(raw)
+        except Exception:
+            queue = []
+        if sym in queue:
+            queue.remove(sym)
+            label, variant = "🗑  Queue for Scrap", "error"
+            self.notify(f"{sym} removed from scrap queue", severity="information")
+        else:
+            queue.append(sym)
+            label, variant = "✅ Cancel Scrap", "warning"
+            self.notify(f"{sym} queued for scrap — will be scrapped after next contract", severity="warning")
+        db.set_bot_setting("pending_scrap", _json.dumps(queue))
+        btn = self.query_one("#scrap-btn2", Button)
+        btn.label = label
+        btn.variant = variant
 
     @on(Button.Pressed, "#close-btn2")
     def _close(self) -> None:
@@ -551,6 +670,15 @@ class MissionControlScreen(Screen):
             agent     = agent_api.get_my_agent()
             ships     = fleet_api.get_my_ships()
             contracts = db.get_active_contracts()
+            # If no accepted contract in DB, fall back to the live API and sync
+            if not any(c["accepted"] and not c["fulfilled"] for c in contracts):
+                try:
+                    live = contracts_api.get_contracts()
+                    for lc in live:
+                        db.upsert_contract(lc)
+                    contracts = db.get_active_contracts()
+                except Exception:
+                    pass
             cph_1h, cph_10m = _calc_cph()
             now = time.time()
             with db._conn() as con:
@@ -583,7 +711,7 @@ class MissionControlScreen(Screen):
         if not rows:
             log_widget.write("[dim]No log entries yet — start play.py[/dim]")
             return
-        for ts_f, msg in rows:
+        for ts_f, msg in reversed(rows):
             dt_str = datetime.fromtimestamp(ts_f).strftime("%H:%M:%S")
             log_widget.write(f"[dim]{dt_str}[/dim] {msg}")
 
@@ -712,7 +840,7 @@ class MissionControlScreen(Screen):
 
 
 # ---------------------------------------------------------------------------
-# Screen 2 — Fleet (full detail)
+# Screen 2 — Fleet (Ships tab + Groups tab)
 # ---------------------------------------------------------------------------
 
 class FleetScreen2(Screen):
@@ -721,26 +849,74 @@ class FleetScreen2(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Label("Fleet  •  ↑↓ navigate  •  Enter / click → ship detail", classes="screen-hint")
-        yield DataTable(id="fleet2-table", cursor_type="row", zebra_stripes=True)
+        with TabbedContent(id="fleet-tabs"):
+            with TabPane("Ships", id="tab-ships"):
+                yield DataTable(id="fleet2-table", cursor_type="row", zebra_stripes=True)
+            with TabPane("Groups", id="tab-groups"):
+                with Horizontal(id="groups-layout"):
+                    # Left: group list
+                    with Vertical(id="groups-list-panel"):
+                        yield Label("  Groups ", classes="panel-title")
+                        yield DataTable(id="groups-table", cursor_type="row", zebra_stripes=True)
+                        with Horizontal(id="group-list-btns"):
+                            yield Button("+ New Group", id="btn-new-group", variant="success")
+                            yield Button("Delete Group", id="btn-delete-group", variant="error")
+                    # Right: group editor
+                    with Vertical(id="groups-editor-panel"):
+                        yield Label("  Group Editor ", classes="panel-title", id="group-editor-title")
+                        yield Static("Select a group or create a new one.", id="group-editor-body")
+                        with Vertical(id="group-form", classes="hidden"):
+                            with Horizontal(classes="form-row"):
+                                yield Label("Name:", classes="form-label")
+                                yield Input(placeholder="e.g. Gas Giant Team", id="group-name-input")
+                            with Horizontal(classes="form-row"):
+                                yield Label("Type:", classes="form-label")
+                                yield Select(
+                                    options=[("⛽ Siphon (gas giant)", "siphon"), ("⛏ Miner (asteroid)", "miner")],
+                                    id="group-type-select2",
+                                    value="siphon",
+                                )
+                            yield Label("  ── Hauler ──", classes="dim")
+                            with Horizontal(id="hauler-assign-row"):
+                                yield Select(options=[("— none —", "__none__")], id="hauler-ship-select")
+                                yield Button("Set Hauler", id="btn-set-hauler2", variant="primary")
+                            yield Label("  ── Workers ──", classes="dim")
+                            with Horizontal(id="worker-assign-row"):
+                                yield Select(options=[("— none —", "__none__")], id="worker-ship-select")
+                                yield Button("Add Worker", id="btn-add-worker2", variant="primary")
+                                yield Button("Remove Worker", id="btn-remove-worker2", variant="warning")
+                            yield Label("", id="group-form-msg")
+                            with Horizontal(id="group-save-row"):
+                                yield Button("Save Group", id="btn-save-group", variant="success")
         yield Label("", id="fleet2-status", classes="status-bar")
         yield Footer()
 
     def on_mount(self) -> None:
         self._ships_map: dict[str, dict] = {}
+        self._all_ships: list[dict] = []
+        self._editing_group_idx: int | None = None  # index into _groups
+        self._groups: list[dict] = []
+        self._draft_group: dict = {}  # working copy while editing
+
         t = self.query_one("#fleet2-table", DataTable)
         t.add_columns(
             "Ship", "Frame", "Status", "Location",
             "From", "→ Destination", "Mode",
             "Fuel", "Cargo", "ETA", "Cooldown",
         )
+        gt = self.query_one("#groups-table", DataTable)
+        gt.add_columns("Name", "Type", "Hauler", "Workers")
+
         self.refresh_data()
         self.set_interval(POLL_INTERVAL, self.refresh_data)
+
+    # ── Data refresh ──────────────────────────────────────────────────────
 
     @work(exclusive=True, thread=True)
     def refresh_data(self) -> None:
         try:
-            ships  = fleet_api.get_my_ships()
-            agent  = agent_api.get_my_agent()
+            ships = fleet_api.get_my_ships()
+            agent = agent_api.get_my_agent()
             self.app.call_from_thread(self._update_table, ships, agent)
         except Exception as e:
             self.app.call_from_thread(
@@ -749,6 +925,7 @@ class FleetScreen2(Screen):
             )
 
     def _update_table(self, ships: list[dict], agent: dict) -> None:
+        self._all_ships = ships
         t = self.query_one("#fleet2-table", DataTable)
         t.clear()
         self._ships_map = {}
@@ -790,6 +967,9 @@ class FleetScreen2(Screen):
             f"CPH(1h): [{cph_color}]{sign}{cph_1h:,}[/{cph_color}]  "
             f"[dim]{len(ships)} ships  •  Updated: {datetime.now().strftime('%H:%M:%S')}[/dim]"
         )
+        self._reload_groups_table()
+
+    # ── Ships tab ─────────────────────────────────────────────────────────
 
     @on(DataTable.RowSelected, "#fleet2-table")
     def _on_ship_selected(self, event: DataTable.RowSelected) -> None:
@@ -797,6 +977,182 @@ class FleetScreen2(Screen):
         ship = self._ships_map.get(sym)
         if ship:
             self.app.push_screen(ShipDetailModal2(ship))
+
+    # ── Groups tab helpers ────────────────────────────────────────────────
+
+    def _load_groups(self) -> list[dict]:
+        try:
+            return json.loads(db.get_bot_setting("ship_groups", "[]"))
+        except Exception:
+            return []
+
+    def _save_groups(self, groups: list[dict]) -> None:
+        db.set_bot_setting("ship_groups", json.dumps(groups))
+
+    def _reload_groups_table(self) -> None:
+        self._groups = self._load_groups()
+        gt = self.query_one("#groups-table", DataTable)
+        gt.clear()
+        for g in self._groups:
+            name    = g.get("name", "—")
+            gtype   = g.get("type", "?")
+            hauler  = g.get("hauler", "—") or "—"
+            workers = ", ".join(g.get("workers", [])) or "—"
+            type_icon = "⛽" if gtype == "siphon" else "⛏"
+            gt.add_row(
+                Text(name, style="bold"),
+                Text(f"{type_icon} {gtype}", style="cyan"),
+                Text(hauler, style="green"),
+                Text(workers, style="yellow"),
+                key=str(self._groups.index(g)),
+            )
+
+    def _populate_ship_selects(self) -> None:
+        """Fill hauler and worker Select widgets with labeled ship options."""
+        opts = [("— none —", "__none__")] + [
+            (_ship_role_label(s), s["symbol"])
+            for s in self._all_ships
+        ]
+        try:
+            self.query_one("#hauler-ship-select", Select).set_options(opts)
+            self.query_one("#worker-ship-select", Select).set_options(opts)
+        except Exception:
+            pass
+
+    def _open_editor(self, group: dict, idx: int | None) -> None:
+        """Show the group form populated with group data."""
+        import copy
+        self._draft_group = copy.deepcopy(group)
+        self._editing_group_idx = idx
+        self.query_one("#group-form").remove_class("hidden")
+        self.query_one("#group-editor-body", Static).update("")
+        title = "New Group" if idx is None else f"Editing: {group.get('name','—')}"
+        self.query_one("#group-editor-title", Label).update(f"  {title} ")
+        self.query_one("#group-name-input", Input).value = group.get("name", "")
+        # type select
+        sel_type = self.query_one("#group-type-select2", Select)
+        sel_type.value = group.get("type", "siphon")
+        # hauler select
+        self._populate_ship_selects()
+        hauler_sel = self.query_one("#hauler-ship-select", Select)
+        hauler_sel.value = group.get("hauler") or "__none__"
+        self._refresh_editor_body()
+
+    def _refresh_editor_body(self) -> None:
+        g = self._draft_group
+        workers = g.get("workers", [])
+        hauler  = g.get("hauler") or "none"
+        lines = [
+            f"[bold cyan]Hauler:[/bold cyan]  [green]{hauler}[/green]",
+            f"[bold cyan]Workers:[/bold cyan] {', '.join(workers) if workers else '[dim]none[/dim]'}",
+        ]
+        self.query_one("#group-editor-body", Static).update("\n".join(lines))
+        self.query_one("#group-form-msg", Label).update("")
+
+    # ── Groups tab events ─────────────────────────────────────────────────
+
+    @on(DataTable.RowSelected, "#groups-table")
+    def _on_group_selected(self, event: DataTable.RowSelected) -> None:
+        idx = int(str(event.row_key.value))
+        if 0 <= idx < len(self._groups):
+            self._open_editor(self._groups[idx], idx)
+
+    @on(Button.Pressed, "#btn-new-group")
+    def _new_group(self) -> None:
+        self._open_editor({"name": "", "type": "siphon", "hauler": None, "workers": []}, None)
+
+    @on(Button.Pressed, "#btn-delete-group")
+    def _delete_group(self) -> None:
+        gt = self.query_one("#groups-table", DataTable)
+        if gt.cursor_row is None:
+            return
+        try:
+            row_key = gt.get_row_at(gt.cursor_row)
+        except Exception:
+            return
+        idx = gt.cursor_row
+        if 0 <= idx < len(self._groups):
+            self._groups.pop(idx)
+            self._save_groups(self._groups)
+            self._reload_groups_table()
+            self.query_one("#group-form").add_class("hidden")
+            self.query_one("#group-editor-body", Static).update("Group deleted.")
+            self._editing_group_idx = None
+
+    @on(Button.Pressed, "#btn-set-hauler2")
+    def _set_hauler(self) -> None:
+        sel = self.query_one("#hauler-ship-select", Select)
+        val = sel.value
+        if val == "__none__" or not val:
+            self._draft_group["hauler"] = None
+        else:
+            self._draft_group["hauler"] = str(val)
+        self._refresh_editor_body()
+
+    @on(Button.Pressed, "#btn-add-worker2")
+    def _add_worker(self) -> None:
+        sel = self.query_one("#worker-ship-select", Select)
+        val = sel.value
+        msg = self.query_one("#group-form-msg", Label)
+        if val == "__none__" or not val:
+            msg.update("[red]Select a ship first[/red]")
+            return
+        sym = str(val)
+        workers = self._draft_group.setdefault("workers", [])
+        if sym == self._draft_group.get("hauler"):
+            msg.update("[red]That ship is the hauler — can't also be a worker[/red]")
+            return
+        if sym not in workers:
+            workers.append(sym)
+        self._refresh_editor_body()
+
+    @on(Button.Pressed, "#btn-remove-worker2")
+    def _remove_worker(self) -> None:
+        sel = self.query_one("#worker-ship-select", Select)
+        val = sel.value
+        msg = self.query_one("#group-form-msg", Label)
+        if val == "__none__" or not val:
+            msg.update("[red]Select a ship to remove[/red]")
+            return
+        sym = str(val)
+        workers = self._draft_group.get("workers", [])
+        if sym in workers:
+            workers.remove(sym)
+            self._refresh_editor_body()
+        else:
+            msg.update(f"[yellow]{sym} is not a worker in this group[/yellow]")
+
+    @on(Button.Pressed, "#btn-save-group")
+    def _save_group(self) -> None:
+        name_input = self.query_one("#group-name-input", Input)
+        sel_type   = self.query_one("#group-type-select2", Select)
+        msg        = self.query_one("#group-form-msg", Label)
+
+        name  = name_input.value.strip()
+        gtype = str(sel_type.value) if sel_type.value != Select.BLANK else "siphon"
+
+        if not name:
+            msg.update("[red]Name is required[/red]")
+            return
+
+        self._draft_group["name"]  = name
+        self._draft_group["type"]  = gtype
+        if not self._draft_group.get("workers"):
+            self._draft_group["workers"] = []
+
+        groups = self._load_groups()
+        if self._editing_group_idx is None:
+            groups.append(self._draft_group)
+        else:
+            if 0 <= self._editing_group_idx < len(groups):
+                groups[self._editing_group_idx] = self._draft_group
+            else:
+                groups.append(self._draft_group)
+
+        self._save_groups(groups)
+        self._reload_groups_table()
+        msg.update(f"[green]✓ Saved '{name}'[/green]")
+        self._editing_group_idx = groups.index(self._draft_group) if self._draft_group in groups else None
 
     def action_refresh_data(self) -> None:
         self.refresh_data()
@@ -864,7 +1220,46 @@ class ContractsScreen2(Screen):
                         "units_required":    r[11],
                         "units_fulfilled":   r[12],
                     })
-            self.app.call_from_thread(self._update, list(contracts.values()))
+            # If DB has no active accepted contract, sync from API
+            contract_list = list(contracts.values())
+            if not any(c["accepted"] and not c["fulfilled"] for c in contract_list):
+                try:
+                    live = contracts_api.get_contracts()
+                    for lc in live:
+                        db.upsert_contract(lc)
+                    # Re-read after sync
+                    with db._conn() as con:
+                        rows2 = con.execute(
+                            """SELECT c.id, c.faction_symbol, c.type, c.accepted, c.fulfilled,
+                                      c.expiration, c.deadline, c.on_accepted, c.on_fulfilled,
+                                      cd.trade_symbol, cd.destination_symbol,
+                                      cd.units_required, cd.units_fulfilled
+                               FROM contracts c
+                               LEFT JOIN contract_deliverables cd ON cd.contract_id = c.id
+                               ORDER BY c.fulfilled ASC, c.accepted DESC, c.last_updated DESC"""
+                        ).fetchall()
+                    contracts = {}
+                    for r in rows2:
+                        cid = r[0]
+                        if cid not in contracts:
+                            contracts[cid] = {
+                                "id": cid, "faction_symbol": r[1], "type": r[2],
+                                "accepted": bool(r[3]), "fulfilled": bool(r[4]),
+                                "expiration": r[5], "deadline": r[6],
+                                "on_accepted": r[7], "on_fulfilled": r[8],
+                                "deliver": [],
+                            }
+                        if r[9]:
+                            contracts[cid]["deliver"].append({
+                                "trade_symbol":      r[9],
+                                "destination_symbol": r[10],
+                                "units_required":    r[11],
+                                "units_fulfilled":   r[12],
+                            })
+                    contract_list = list(contracts.values())
+                except Exception:
+                    pass
+            self.app.call_from_thread(self._update, contract_list)
         except Exception as e:
             self.app.call_from_thread(
                 self.query_one("#contracts2-status", Label).update,
@@ -1732,9 +2127,24 @@ class SettingsScreen2(Screen):
                 yield Label("Bot Controls", classes="panel-title")
                 yield Static("", id="settings2-info")
                 yield Button("Toggle Auto-Buy", id="toggle2-auto-buy", variant="primary")
+                yield Button("Toggle Auto-Group", id="toggle2-auto-group", variant="default")
                 yield Label("", id="settings2-cmd-label", classes="panel-title")
                 yield Button("✓  Idle",   id="btn2-cmd-idle",   variant="success")
                 yield Button("Hauler",    id="btn2-cmd-hauler", variant="default")
+                yield Label("Discord Notifications", classes="panel-title")
+                yield Input(
+                    placeholder="https://discord.com/api/webhooks/...",
+                    id="discord2-webhook",
+                    password=False,
+                )
+                with Horizontal(id="discord2-interval-row"):
+                    yield Input(
+                        placeholder="Status interval (min, default 5)",
+                        id="discord2-interval",
+                        restrict="0123456789",
+                    )
+                    yield Button("Save Discord", id="btn2-discord-save", variant="primary")
+                yield Label("", id="discord2-msg")
             with Vertical(id="settings2-targets"):
                 yield Label("Ship Buy Targets", classes="panel-title")
                 yield DataTable(id="targets2-table", zebra_stripes=True)
@@ -1750,12 +2160,19 @@ class SettingsScreen2(Screen):
     def on_mount(self) -> None:
         t = self.query_one("#targets2-table", DataTable)
         t.add_columns("Ship Type", "Max", "Role")
+        # Pre-fill Discord fields from DB
+        wh = db.get_bot_setting("discord_webhook", "")
+        if wh:
+            self.query_one("#discord2-webhook", Input).value = wh
+        iv = db.get_bot_setting("discord_status_interval", "300")
+        self.query_one("#discord2-interval", Input).value = str(int(iv) // 60)
         self._refresh()
         self.set_interval(5, self._refresh)
 
     def _refresh(self) -> None:
         raw     = db.get_bot_setting("ship_buy_list", "[]")
         enabled = db.get_bot_setting("auto_buy_ships", "true").lower() == "true"
+        auto_group = db.get_bot_setting("auto_group_ships", "0") == "1"
         try:
             targets = json.loads(raw)
         except Exception:
@@ -1768,6 +2185,7 @@ class SettingsScreen2(Screen):
             role  = {
                 "SHIP_ORE_HOUND":       "miner",
                 "SHIP_MINING_DRONE":    "miner",
+                "SHIP_SIPHON_DRONE":    "siphoner",
                 "SHIP_SURVEYOR":        "surveyor",
                 "SHIP_LIGHT_HAULER":    "hauler",
                 "SHIP_HEAVY_FREIGHTER": "hauler",
@@ -1779,15 +2197,20 @@ class SettingsScreen2(Screen):
                 key=str(i),
             )
 
-        auto_buy_str = "[green]ENABLED ✓[/green]" if enabled else "[red]DISABLED ✗[/red]"
+        auto_buy_str   = "[green]ENABLED ✓[/green]"  if enabled    else "[red]DISABLED ✗[/red]"
+        auto_group_str = "[green]ENABLED ✓[/green]"  if auto_group else "[yellow]OFF (manual groups)[/yellow]"
         self.query_one("#settings2-info", Static).update(
             f"  Auto-buy: {auto_buy_str}\n"
+            f"  Auto-group: {auto_group_str}\n"
             f"  Ship targets: {len(targets)}\n"
+            f"  [dim]Team fill: 5 workers + 1 hauler/team  •  max 2 siphon / 2 miner teams[/dim]\n"
             f"  [dim]Edit targets below, then restart play.py to apply[/dim]"
         )
         self.query_one("#settings2-status", Label).update(
             f"[dim]Updated: {datetime.now().strftime('%H:%M:%S')}  •  "
             + ("[green]Auto-buy ON[/green]" if enabled else "[red]Auto-buy OFF[/red]")
+            + "  •  "
+            + ("[green]Auto-group ON[/green]" if auto_group else "[yellow]Auto-group OFF[/yellow]")
             + f"  •  {len(targets)} target(s)[/dim]"
         )
         cmd_role = db.get_bot_setting("command_ship_role", "idle")
@@ -1802,6 +2225,10 @@ class SettingsScreen2(Screen):
         else:
             idle_btn.label   = "✓  Idle";    idle_btn.variant   = "success"
             hauler_btn.label = "Hauler";     hauler_btn.variant = "default"
+        # Reflect auto-group toggle state in button variant
+        ag_btn = self.query_one("#toggle2-auto-group", Button)
+        ag_btn.variant = "success" if auto_group else "default"
+        ag_btn.label   = "✓ Auto-Group ON" if auto_group else "Auto-Group (manual)"
 
     @on(Button.Pressed, "#btn2-cmd-idle")
     def _set_cmd_idle(self)   -> None:
@@ -1816,6 +2243,30 @@ class SettingsScreen2(Screen):
         current = db.get_bot_setting("auto_buy_ships", "true").lower() == "true"
         db.set_bot_setting("auto_buy_ships", "false" if current else "true")
         self._refresh()
+
+    @on(Button.Pressed, "#toggle2-auto-group")
+    def _toggle_auto_group(self) -> None:
+        current = db.get_bot_setting("auto_group_ships", "0") == "1"
+        db.set_bot_setting("auto_group_ships", "0" if current else "1")
+        self._refresh()
+
+    @on(Button.Pressed, "#btn2-discord-save")
+    def _save_discord(self) -> None:
+        wh  = self.query_one("#discord2-webhook", Input).value.strip()
+        iv  = self.query_one("#discord2-interval", Input).value.strip()
+        msg = self.query_one("#discord2-msg", Label)
+        if wh and not wh.startswith("https://discord.com/api/webhooks/"):
+            msg.update("[red]Invalid webhook URL[/red]")
+            return
+        db.set_bot_setting("discord_webhook", wh)
+        try:
+            secs = max(60, int(iv) * 60) if iv else 300
+        except ValueError:
+            secs = 300
+        db.set_bot_setting("discord_status_interval", str(secs))
+        status = "[green]Saved ✓[/green]" if wh else "[yellow]Cleared (notifications disabled)[/yellow]"
+        msg.update(status)
+        self.notify("Discord settings saved", severity="information")
 
     @on(Button.Pressed, "#btn2-add")
     def _add_ship(self) -> None:
@@ -1907,6 +2358,19 @@ class SpaceTradersApp2(App):
     def on_mount(self) -> None:
         db.init_db()
         self.push_screen("mission")
+        self.set_interval(5.0, self._refresh_credits)
+
+    @work(thread=True)
+    def _refresh_credits(self) -> None:
+        try:
+            agent = agent_api.get_my_agent()
+            credits = agent.get("credits", 0)
+            self.app.call_from_thread(
+                setattr, self.app, "sub_title",
+                f"System: {SYSTEM}  |  Credits: {credits:,} cr"
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -343,5 +343,111 @@ ShipDetailModal2, ContractDetailModal2 {
 
 #close-btn2 {
     margin-top: 1;
+}
+
+#ship-modal-actions {
     dock: bottom;
+    height: auto;
+    padding-top: 1;
+    align: left middle;
+}
+
+#scrap-btn2 {
+    margin-right: 1;
+}
+
+/* ── Fleet screen Groups tab ──────────────────────────────────────────────── */
+
+#groups-layout {
+    height: 1fr;
+}
+
+#groups-list-panel {
+    width: 38;
+    border-right: solid #30363d;
+    padding-right: 1;
+}
+
+#groups-table {
+    height: 1fr;
+}
+
+#group-list-btns {
+    height: auto;
+    margin-top: 1;
+}
+
+#group-list-btns Button {
+    margin-right: 1;
+    width: auto;
+}
+
+#groups-editor-panel {
+    padding-left: 1;
+    width: 1fr;
+}
+
+#group-form {
+    height: auto;
+    margin-top: 1;
+}
+
+#group-form.hidden {
+    display: none;
+}
+
+.form-row {
+    height: auto;
+    margin-bottom: 1;
+    align: left middle;
+}
+
+.form-label {
+    width: 8;
+    color: #8b949e;
+}
+
+#group-name-input {
+    width: 30;
+}
+
+#group-type-select2 {
+    width: 30;
+}
+
+#hauler-assign-row {
+    height: auto;
+    margin-bottom: 1;
+    align: left middle;
+}
+
+#worker-assign-row {
+    height: auto;
+    margin-bottom: 1;
+    align: left middle;
+}
+
+#hauler-assign-row Select,
+#worker-assign-row Select {
+    width: 32;
+    margin-right: 1;
+}
+
+#hauler-assign-row Button,
+#worker-assign-row Button {
+    margin-right: 1;
+}
+
+#group-save-row {
+    height: auto;
+    margin-top: 1;
+}
+
+#group-editor-body {
+    padding: 1 0;
+}
+
+#group-form-msg {
+    height: 1;
+    margin-bottom: 1;
 }
