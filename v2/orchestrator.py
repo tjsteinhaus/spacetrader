@@ -35,6 +35,7 @@ from roles.explorer import ExplorerRole
 from roles.siphoner import SiphonerRole
 from roles.fleet_manager import FleetManagerRole
 import db
+import discord_notify as discord
 
 if TYPE_CHECKING:
     pass
@@ -73,6 +74,12 @@ class Orchestrator:
             log.info("Orchestrator ready — entering main loop")
             try:
                 await self._main_loop()
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                discord.send_shutdown("KeyboardInterrupt")
+                raise
+            except Exception as _e:
+                discord.send_shutdown(f"Unhandled exception: {_e}")
+                raise
             finally:
                 self._stop.set()
                 heartbeat.cancel()
@@ -199,6 +206,7 @@ class Orchestrator:
                     "Working contract %s: %s × %d (fulfilled %d) → %s",
                     cid, good, req, fulf, dest,
                 )
+                discord.send_contract_start(contract)
 
                 ctx = ContractContext(
                     contract_id=cid,
@@ -232,6 +240,13 @@ class Orchestrator:
                 log.info("[STEP] wait complete. ctx.done=%s stop=%s", ctx.done.is_set(), self._stop.is_set())
                 if ctx.done.is_set():
                     log.info("Contract %s complete — starting new cycle", cid)
+                    earned = contract.get("terms", {}).get("payment", {}).get("onFulfilled", 0)
+                    discord.send_contract_finish(contract, earned)
+                    try:
+                        me = await self._client.get("/my/agent")
+                        db.record_credits(me.get("credits", 0))
+                    except Exception:
+                        pass
                     await self._cancel_all_tasks()
                     await asyncio.sleep(10)
 
@@ -267,9 +282,61 @@ class Orchestrator:
             return
 
         log.info("[ASSIGN] got %d ships", len(ships))
+
+        # ── Direct-buy contract detection ─────────────────────────────
+        # If the contract good can be bought directly from a market, assign
+        # roles the same way as v1: one dedicated buyer, rest mine for income.
+        contract_good = ""
+        if contract:
+            deliver = (contract.get("terms", {}).get("deliver") or [{}])[0]
+            contract_good = deliver.get("tradeSymbol", "")
+
+        buy_wp = await self._market.best_buy_waypoint(contract_good) if contract_good else None
+        is_direct_buy_contract = bool(buy_wp)
+
+        if is_direct_buy_contract:
+            miners  = [s["symbol"] for s in ships
+                       if any("MINING" in m.get("symbol", "") for m in s.get("mounts", []))]
+            haulers = [s["symbol"] for s in ships
+                       if s.get("registration", {}).get("role", "") in ("HAULER", "TRANSPORT")
+                       and s["symbol"] != self._cfg.fleet_manager_ship]
+
+            if len(haulers) >= 2:
+                # First hauler buys + delivers; rest trade for income; all miners mine + sell
+                forced_buyer_ships = frozenset([haulers[0]])
+                mine_only_ships    = frozenset(miners)
+                trader_ships       = set(haulers[1:])
+                log.info("[ASSIGN] direct-buy: hauler %s buys/delivers; %d miner(s) mine; %d hauler(s) trade",
+                         haulers[0], len(miners), len(haulers) - 1)
+            elif haulers:
+                # 1 hauler → let it trade; first miner is the forced buyer
+                forced_buyer_ships = frozenset([miners[0]]) if miners else frozenset()
+                mine_only_ships    = frozenset(miners[1:]) if len(miners) > 1 else frozenset()
+                trader_ships       = set(haulers)
+                log.info("[ASSIGN] direct-buy: miner %s buys/delivers; hauler %s trades; %d other miner(s) mine",
+                         (miners[0] if miners else "none"), haulers[0], max(0, len(miners) - 1))
+            else:
+                # No hauler — first miner buys, rest mine
+                forced_buyer_ships = frozenset([miners[0]]) if miners else frozenset()
+                mine_only_ships    = frozenset(miners[1:]) if len(miners) > 1 else frozenset()
+                trader_ships: set[str] = set()
+                log.info("[ASSIGN] direct-buy: miner %s buys/delivers; %d other miner(s) mine",
+                         (miners[0] if miners else "none"), max(0, len(miners) - 1))
+
+            ctx.forced_buyer_ships = forced_buyer_ships
+            ctx.mine_only_ships    = mine_only_ships
+        else:
+            trader_ships = set()
+
         for ship in ships:
             sym = ship["symbol"]
-            role_name = self._strategy.assign_role(ship, contract, self._cfg)
+
+            # Override role for trader ships in direct-buy mode
+            if is_direct_buy_contract and sym in trader_ships:
+                role_name = "trader"
+            else:
+                role_name = self._strategy.assign_role(ship, contract, self._cfg)
+
             role = self._build_role(sym, role_name, ctx)
             if role is None:
                 log.debug("%s → idle", sym)
