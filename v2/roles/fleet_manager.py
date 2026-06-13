@@ -10,7 +10,7 @@ import logging
 from client import SpaceTradersError
 from api import fleet as fleet_api, agent as agent_api, universe as universe_api
 import db
-from constants import SHIP_SCORES, MINING_MOUNT_TIERS
+from constants import SHIP_SCORES, MINING_MOUNT_TIERS, NO_DRIFT_DIST_MAX
 from .base import BaseRole
 
 
@@ -148,6 +148,17 @@ class FleetManagerRole(BaseRole):
         if credits < self._cfg.min_buy_credits:
             return
 
+        # Build fleet snapshot once for scoring decisions
+        all_ships = await fleet_api.get_my_ships(self._client)
+        miner_count = sum(
+            1 for s in all_ships
+            if any("MINING" in m.get("symbol", "") for m in s.get("mounts", []))
+        )
+        hauler_count = sum(
+            1 for s in all_ships
+            if s.get("registration", {}).get("role", "") in ("HAULER", "TRANSPORT")
+        )
+
         for shipyard_wp in self._cfg.shipyard_wps:
             try:
                 yard_data = await universe_api.get_shipyard(
@@ -157,9 +168,31 @@ class FleetManagerRole(BaseRole):
                 if not available:
                     continue
 
-                # Score and sort by SHIP_SCORES
+                # Score each ship type dynamically
+                def _score(ship_info: dict) -> int:
+                    stype = ship_info.get("type", "")
+                    base = SHIP_SCORES.get(stype, -1)
+                    if base < 0:
+                        return -1
+                    if stype == "SHIP_MINING_DRONE":
+                        if not _is_mining_drone_safe(self._cfg.asteroid, self._market):
+                            self.log.debug("MINING_DRONE skipped — asteroid too far from fuel market")
+                            return -1
+                        if hauler_count == 0:
+                            return -1
+                    if stype == "SHIP_ORE_HOUND":
+                        if hauler_count == 0:
+                            return -1
+                    if stype in ("SHIP_SIPHON_DRONE", "SHIP_GAS_DRONE"):
+                        if not _is_siphon_reachable(self._cfg.system, self._market):
+                            self.log.debug("%s skipped — gas giant too far from fuel market", stype)
+                            return -1
+                        if hauler_count == 0:
+                            return -1
+                    return base
+
                 scored = sorted(
-                    [(SHIP_SCORES.get(s.get("type", ""), -1), s) for s in available],
+                    [(_score(s), s) for s in available],
                     key=lambda t: t[0],
                     reverse=True,
                 )
@@ -179,7 +212,6 @@ class FleetManagerRole(BaseRole):
                         matching = next((t for t in targets if t.get("type") == ship_type), None)
                         if not matching:
                             continue
-                        # Count current ships of this type
                         current_ships = await fleet_api.get_my_ships(self._client)
                         existing_count = sum(
                             1 for s in current_ships
@@ -204,6 +236,8 @@ class FleetManagerRole(BaseRole):
                         new_sym = new_ship.get("symbol", "?")
                         ag = result.get("agent", {})
                         credits = ag.get("credits", credits - purchase_price)
+                        hauler_count += 1 if "HAULER" in ship_type or "FREIGHTER" in ship_type else 0
+                        miner_count  += 1 if "MINING" in ship_type or "ORE" in ship_type else 0
                         self.log.info("Purchased %s! Credits now: %d", new_sym, credits)
                         break  # one purchase per shipyard per cycle
                     except SpaceTradersError as e:
@@ -256,6 +290,63 @@ class FleetManagerRole(BaseRole):
                 self.log.debug("%s: no live trade goods (listing-only market)", target_wp)
         except SpaceTradersError as e:
             self.log.warning("Market scan %s failed: %s", target_wp, e)
+
+def _is_mining_drone_safe(asteroid: str, market) -> bool:
+    """True if the asteroid is within NO_DRIFT_DIST_MAX units of a fuel market."""
+    fuel_markets = market.exporters("FUEL") if market else []
+    if not fuel_markets:
+        return False
+    coords = db.get_waypoint_coords(asteroid)
+    if not coords:
+        return False  # unknown — be conservative
+    ax, ay = coords
+    for fm in fuel_markets:
+        fc = db.get_waypoint_coords(fm)
+        if not fc:
+            continue
+        fx, fy = fc
+        dist = ((ax - fx) ** 2 + (ay - fy) ** 2) ** 0.5
+        if dist <= NO_DRIFT_DIST_MAX:
+            return True
+    return False
+
+
+def _is_siphon_reachable(system: str, market) -> bool:
+    """True if any gas giant in the system is within NO_DRIFT_DIST_MAX of a fuel market."""
+    fuel_markets = market.exporters("FUEL") if market else []
+    if not fuel_markets:
+        return False
+    # Find gas giants from DB waypoints
+    import sqlite3
+    try:
+        with db._conn() as con:
+            gas_giants = [
+                r[0] for r in con.execute(
+                    "SELECT symbol FROM waypoints WHERE system_symbol = ? AND type = 'GAS_GIANT'",
+                    (system,),
+                ).fetchall()
+            ]
+    except Exception:
+        return False
+    if not gas_giants:
+        return False
+    fuel_coords = []
+    for fm in fuel_markets:
+        fc = db.get_waypoint_coords(fm)
+        if fc:
+            fuel_coords.append(fc)
+    if not fuel_coords:
+        return False
+    for gg in gas_giants:
+        gc = db.get_waypoint_coords(gg)
+        if not gc:
+            continue
+        gx, gy = gc
+        for fx, fy in fuel_coords:
+            if ((gx - fx) ** 2 + (gy - fy) ** 2) ** 0.5 <= NO_DRIFT_DIST_MAX:
+                return True
+    return False
+
 
 def _best_mount_tier(ship: dict) -> int:
     symbols = {m.get("symbol", "") for m in ship.get("mounts", [])}
