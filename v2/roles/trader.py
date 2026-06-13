@@ -18,6 +18,7 @@ import logging
 from client import SpaceTradersError
 from api import fleet as fleet_api, agent as agent_api
 import db
+import discord_notify as discord
 from .base import BaseRole
 
 # Trading constants
@@ -177,6 +178,7 @@ class TraderRole(BaseRole):
 
         # ── Buy in batches ──
         bought     = 0
+        total_cost = 0
         batch_size = 40
         while bought < to_buy and not stop.is_set():
             chunk = min(batch_size, to_buy - bought)
@@ -187,6 +189,7 @@ class TraderRole(BaseRole):
                 ppu = tx.get("pricePerUnit", live_buy)
                 credits_after = result.get("agent", {}).get("credits", 0)
                 bought += units_bought
+                total_cost += units_bought * ppu
                 self.log.info(
                     "Bought %dx %s @ %d/u | Credits: %d",
                     units_bought, good, ppu, credits_after,
@@ -215,13 +218,20 @@ class TraderRole(BaseRole):
         if bought == 0:
             return
 
+        est_profit = bought * (live_sell - live_buy)
+        discord.send_trade_start(self.ship_symbol, good, buy_wp, sell_wp, bought, live_buy, est_profit)
+
         # ── Navigate to sell market ──
         await self._navigate_with_refuel(sell_wp)
         await self._ensure_docked()
         sell_wp_actual = (await self._get_ship())["nav"]["waypointSymbol"]
 
         # ── Sell in batches with price floor ──
-        await self._sell_batched(good, bought, sell_wp_actual, stop, min_sell_price=live_buy)
+        revenue = await self._sell_batched(good, bought, sell_wp_actual, stop, min_sell_price=live_buy)
+        discord.send_trade_finish(
+            self.ship_symbol, good, buy_wp, sell_wp_actual,
+            bought, total_cost, revenue, revenue - total_cost,
+        )
 
         # ── Backhaul: check if sell market has a good outbound route ──
         await self._try_backhaul(sell_wp_actual, stop)
@@ -233,8 +243,8 @@ class TraderRole(BaseRole):
         sell_wp: str,
         stop: asyncio.Event,
         min_sell_price: int = 0,
-    ) -> None:
-        """Sell `good` in batches; stop early if price crashes below 10% of first batch or cost floor."""
+    ) -> int:
+        """Sell `good` in batches; stop early if price crashes below 10% of first batch or cost floor. Returns total revenue."""
         ship      = await self._get_ship()
         have      = sum(i["units"] for i in ship["cargo"].get("inventory", []) if i["symbol"] == good)
         to_sell   = min(total_units, have)
@@ -285,6 +295,7 @@ class TraderRole(BaseRole):
 
         if sold > 0:
             self.log.info("Total: sold %dx %s = %d cr", sold, good, total_rev)
+        return total_rev
 
     async def _try_backhaul(self, current_wp: str, stop: asyncio.Event) -> None:
         """After selling at current_wp, check if there's a good outbound buy→sell route."""
