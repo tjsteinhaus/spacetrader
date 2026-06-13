@@ -146,12 +146,13 @@ class ContractGrindStrategy:
         has_jump   = any("JUMP_DRIVE" in m.get("symbol", "") for m in modules)
         has_warp   = any("WARP_DRIVE" in m.get("symbol", "") for m in modules)
         capacity   = ship.get("cargo", {}).get("capacity", 0)
+        frame_sym  = ship.get("frame", {}).get("symbol", "")
 
         if has_survey and not has_mining:
             return "surveyor"
         if has_siphon and not has_mining:
             return "siphoner"
-        if has_jump or has_warp:
+        if has_jump or has_warp or frame_sym == "FRAME_PROBE":
             return "explorer"
         if has_mining:
             return "miner"

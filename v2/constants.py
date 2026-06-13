@@ -68,16 +68,16 @@ ASTEROID_TRAIT_SCORES: dict[str, int] = {
 # Dynamic safety checks in fleet_manager override positive scores when
 # the asteroid or gas giant is too far from any fuel market.
 SHIP_SCORES: dict[str, int] = {
-    "SHIP_LIGHT_HAULER":    100,  # First buy — seed arbitrage; needed before miners
-    "SHIP_ORE_HOUND":        65,  # Best miner — only after hauler(s) purchased
+    "SHIP_LIGHT_HAULER":    100,  # Seed new teams + traders — always first priority
     "SHIP_MINING_DRONE":     60,  # Cheap miner — no-drift check required
     "SHIP_SIPHON_DRONE":     55,  # Passive gas — no-drift check required
+    "SHIP_PROBE":            20,  # Scout/charter — buy when wealthy (>1M cr), explore all systems
+    "SHIP_ORE_HOUND":        15,  # Miner — lower priority until groups prove out
     "SHIP_SURVEYOR":         -1,  # Skip — buy goods from market, don't mine
     "SHIP_HEAVY_FREIGHTER":  -1,  # Never buy
     "SHIP_COMMAND_FRIGATE":  -1,  # Already have one
     "SHIP_GAS_DRONE":        -1,  # Never buy
     "SHIP_LIGHT_SHUTTLE":    -1,  # Never buy — tiny cargo, wrong role
-    "SHIP_PROBE":            -1,  # Never buy (deployed manually)
 }
 
 # Maximum distance from a fuel market for mining/siphon drones to be considered
@@ -143,6 +143,11 @@ DEFAULT_CHEAP_BUY_THRESHOLD = 200
 DEFAULT_SELL_ROUTING_DIST_COST = 20
 DEFAULT_MIN_CONTRACT_PAYOUT = 30_000
 DEFAULT_MIN_FUEL_CAPACITY   = 150
+
+# Team composition / purchase caps.
+MAX_TRADERS               = 3           # free (non-group) haulers dedicated to arbitrage
+PROBE_CREDIT_THRESHOLD    = 1_000_000   # don't buy probes until we have this many credits
+MAX_PROBES                = 10          # max probe fleet (one per reachable system)
 
 # Hauler departure thresholds.
 HAULER_DEPART_FRACTION   = 0.50   # leave when cargo >= 50% full

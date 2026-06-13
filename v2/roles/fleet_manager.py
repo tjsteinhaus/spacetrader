@@ -10,7 +10,7 @@ import logging
 from client import SpaceTradersError
 from api import fleet as fleet_api, agent as agent_api, universe as universe_api
 import db
-from constants import SHIP_SCORES, MINING_MOUNT_TIERS, NO_DRIFT_DIST_MAX
+from constants import SHIP_SCORES, MINING_MOUNT_TIERS, NO_DRIFT_DIST_MAX, MAX_TRADERS, PROBE_CREDIT_THRESHOLD, MAX_PROBES
 from .base import BaseRole
 
 
@@ -158,6 +158,19 @@ class FleetManagerRole(BaseRole):
             1 for s in all_ships
             if s.get("registration", {}).get("role", "") in ("HAULER", "TRANSPORT")
         )
+        probe_count = sum(
+            1 for s in all_ships
+            if s.get("frame", {}).get("symbol", "") == "FRAME_PROBE"
+        )
+        # Free haulers = all haulers minus those assigned to groups
+        import groups as _groups
+        grouped_haulers = {g.get("hauler") for g in _groups.load_groups()}
+        free_hauler_count = sum(
+            1 for s in all_ships
+            if s.get("registration", {}).get("role", "") in ("HAULER", "TRANSPORT")
+            and s["symbol"] not in grouped_haulers
+            and s["symbol"] != self._cfg.fleet_manager_ship
+        )
 
         for shipyard_wp in self._cfg.shipyard_wps:
             try:
@@ -174,6 +187,13 @@ class FleetManagerRole(BaseRole):
                     base = SHIP_SCORES.get(stype, -1)
                     if base < 0:
                         return -1
+                    if stype == "SHIP_LIGHT_HAULER":
+                        # Keep buying haulers until teams are full AND we have enough traders
+                        need_trader = free_hauler_count < MAX_TRADERS
+                        if not need_trader:
+                            # Check if teams still need a hauler (handled below in group logic;
+                            # here we do a simple pass-through and let group gating decide)
+                            pass  # always allow if a team needs a hauler
                     if stype == "SHIP_MINING_DRONE":
                         if not _is_mining_drone_safe(self._cfg.asteroid, self._market):
                             self.log.debug("MINING_DRONE skipped — asteroid too far from fuel market")
@@ -188,6 +208,11 @@ class FleetManagerRole(BaseRole):
                             self.log.debug("%s skipped — gas giant too far from fuel market", stype)
                             return -1
                         if hauler_count == 0:
+                            return -1
+                    if stype == "SHIP_PROBE":
+                        if credits < PROBE_CREDIT_THRESHOLD:
+                            return -1
+                        if probe_count >= MAX_PROBES:
                             return -1
                     return base
 
@@ -236,8 +261,10 @@ class FleetManagerRole(BaseRole):
                         new_sym = new_ship.get("symbol", "?")
                         ag = result.get("agent", {})
                         credits = ag.get("credits", credits - purchase_price)
-                        hauler_count += 1 if "HAULER" in ship_type or "FREIGHTER" in ship_type else 0
-                        miner_count  += 1 if "MINING" in ship_type or "ORE" in ship_type else 0
+                        hauler_count      += 1 if "HAULER" in ship_type or "FREIGHTER" in ship_type else 0
+                        miner_count       += 1 if "MINING" in ship_type or "ORE" in ship_type else 0
+                        probe_count       += 1 if ship_type == "SHIP_PROBE" else 0
+                        free_hauler_count += 1 if "HAULER" in ship_type or "FREIGHTER" in ship_type else 0
                         self.log.info("Purchased %s! Credits now: %d", new_sym, credits)
                         break  # one purchase per shipyard per cycle
                     except SpaceTradersError as e:
