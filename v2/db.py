@@ -229,6 +229,44 @@ CREATE TABLE IF NOT EXISTS bot_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS credits_history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    credits   INTEGER NOT NULL,
+    timestamp REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credits_ts
+    ON credits_history(timestamp);
+
+CREATE TABLE IF NOT EXISTS bot_logs (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    message   TEXT NOT NULL,
+    timestamp REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trade_trips (
+    id         TEXT PRIMARY KEY,
+    ship       TEXT NOT NULL,
+    good       TEXT NOT NULL,
+    buy_wp     TEXT NOT NULL,
+    sell_wp    TEXT NOT NULL,
+    units      INTEGER NOT NULL,
+    cost       INTEGER NOT NULL DEFAULT 0,
+    revenue    INTEGER NOT NULL DEFAULT 0,
+    timestamp  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deliveries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_id  TEXT NOT NULL,
+    trade_symbol TEXT NOT NULL,
+    ship_symbol  TEXT NOT NULL,
+    units        INTEGER NOT NULL,
+    fulfilled    INTEGER NOT NULL,
+    required     INTEGER NOT NULL,
+    timestamp    REAL NOT NULL
+);
 """
 
 
@@ -544,6 +582,96 @@ def log_extraction(
                (waypoint_symbol, ship_symbol, survey_signature, trade_symbol, units, timestamp)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (waypoint_symbol, ship_symbol, survey_signature, trade_symbol, units, time.time()),
+        )
+
+
+def record_credits(credits: int, path: Path | str | None = None) -> None:
+    """Append a credits snapshot for CPH tracking and the analytics chart."""
+    with _conn(path) as con:
+        con.execute(
+            "INSERT INTO credits_history (credits, timestamp) VALUES (?, ?)",
+            (credits, time.time()),
+        )
+
+
+def get_cph(window_secs: int = 3600, path: Path | str | None = None) -> int:
+    """Return net credits per hour over the last window_secs by comparing credits_history snapshots.
+
+    Falls back to market_transactions-based calculation when history is sparse.
+    """
+    now = time.time()
+    cutoff = now - window_secs
+    with _conn(path) as con:
+        rows = con.execute(
+            "SELECT credits, timestamp FROM credits_history WHERE timestamp >= ? ORDER BY timestamp",
+            (cutoff,),
+        ).fetchall()
+        if len(rows) >= 2:
+            oldest_credits, oldest_ts = rows[0]
+            newest_credits, newest_ts = rows[-1]
+            elapsed = max(1, newest_ts - oldest_ts)
+            return int((newest_credits - oldest_credits) / elapsed * 3600)
+        # Fallback: use transaction history
+        row = con.execute(
+            """SELECT
+                SUM(CASE WHEN type='SELL'     AND timestamp > ? THEN  total_price
+                         WHEN type='PURCHASE' AND timestamp > ? THEN -total_price
+                         ELSE 0 END)
+               FROM market_transactions""",
+            (cutoff, cutoff),
+        ).fetchone()
+        return int(row[0] or 0)
+
+
+def write_log(msg: str, path: Path | str | None = None) -> None:
+    """Append a log message to bot_logs (non-blocking best-effort)."""
+    try:
+        with _conn(path) as con:
+            con.execute(
+                "INSERT INTO bot_logs (message, timestamp) VALUES (?, ?)",
+                (msg, time.time()),
+            )
+    except Exception:
+        pass
+
+
+def record_delivery(
+    contract_id: str,
+    trade_symbol: str,
+    ship_symbol: str,
+    units: int,
+    fulfilled: int,
+    required: int,
+    path: Path | str | None = None,
+) -> None:
+    """Record a contract delivery event."""
+    with _conn(path) as con:
+        con.execute(
+            """INSERT INTO deliveries
+               (contract_id, trade_symbol, ship_symbol, units, fulfilled, required, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (contract_id, trade_symbol, ship_symbol, units, fulfilled, required, time.time()),
+        )
+
+
+def log_trade_trip(
+    trip_id: str,
+    ship_symbol: str,
+    good: str,
+    buy_wp: str,
+    sell_wp: str,
+    units: int,
+    cost: int,
+    revenue: int,
+    path: Path | str | None = None,
+) -> None:
+    """Upsert a completed trade trip record."""
+    with _conn(path) as con:
+        con.execute(
+            """INSERT OR REPLACE INTO trade_trips
+               (id, ship, good, buy_wp, sell_wp, units, cost, revenue, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trip_id, ship_symbol, good, buy_wp, sell_wp, units, cost, revenue, time.time()),
         )
 
 
