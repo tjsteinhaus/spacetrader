@@ -4315,6 +4315,22 @@ def work_contract(contract: dict) -> None:
         haulers.append(FLEET_MANAGER_SHIP)
     miners = miners or [COMMAND_SHIP]
 
+    # ── Pre-compute groups early so group haulers are excluded from contract buyer pool ──
+    auto_group_ships()
+    with _ship_groups_lock:
+        _ship_groups = _load_ship_groups()
+    _all_symbols_pre = set(s["symbol"] for s in all_fleet)
+    _pre_grouped_haulers: set[str] = set()
+    _pre_grouped_workers: set[str] = set()
+    for grp in _ship_groups:
+        h = grp.get("hauler", "")
+        ws = [w for w in grp.get("workers", []) if w in _all_symbols_pre]
+        if h in _all_symbols_pre and ws:
+            _pre_grouped_haulers.add(h)
+            _pre_grouped_workers.update(ws)
+    # Exclude group-assigned haulers from the contract buyer / trader pools
+    haulers_free = [h for h in haulers if h not in _pre_grouped_haulers and h not in _pre_grouped_workers]
+
     # ── Direct-buy contract: best ship buys/delivers; miners focus on income ────
     global _mine_only_contract
     _contract_good = contract["terms"]["deliver"][0]["tradeSymbol"] if contract["terms"].get("deliver") else ""
@@ -4338,24 +4354,24 @@ def work_contract(contract: dict) -> None:
                 "payment": contract["terms"]["payment"],
             },
         }
-        if len(haulers) >= 2:
-            # Assign the first hauler as the dedicated contract buyer — larger fuel
+        if len(haulers_free) >= 2:
+            # Assign the first free hauler as the dedicated contract buyer — larger fuel
             # tank and potential jump drive make it better suited for long buy routes.
-            _contract_buyer = haulers[0]
-            _haulers_for_buy = [haulers[0]]
-            _haulers_for_trade = haulers[1:]
+            _contract_buyer = haulers_free[0]
+            _haulers_for_buy = [haulers_free[0]]
+            _haulers_for_trade = haulers_free[1:]
             log(f"[cyan]Direct-buy contract: hauler {_contract_buyer} handles buy/deliver; "
                 f"{len(miners)} miner(s) mine for income[/cyan]")
-        elif haulers:
-            # Only 1 hauler — arbitrage earns more; let miner handle the contract buy/deliver.
+        elif haulers_free:
+            # Only 1 free hauler — arbitrage earns more; let miner handle the contract buy/deliver.
             _contract_buyer = miners[0]
             _haulers_for_buy = []
-            _haulers_for_trade = haulers  # single hauler does arbitrage
+            _haulers_for_trade = haulers_free  # single hauler does arbitrage
             _contract_buy_ships.add(miners[0])
             log(f"[cyan]Direct-buy contract: {miners[0]} handles buy/deliver; "
-                f"single hauler {haulers[0]} does arbitrage[/cyan]")
+                f"single hauler {haulers_free[0]} does arbitrage[/cyan]")
         else:
-            # No hauler available — fall back to first miner doing the run.
+            # No free hauler available — fall back to first miner doing the run.
             _contract_buyer = miners[0]
             _haulers_for_buy = []
             _haulers_for_trade = []
@@ -4377,18 +4393,18 @@ def work_contract(contract: dict) -> None:
                 _trader_symbols.extend(_haulers_for_trade)
                 log(f"[blue]Launching {len(_haulers_for_trade)} hauler(s) as trader(s) (direct-buy contract): {_haulers_for_trade}[/blue]")
         else:
-            # Mining contract: with 2+ haulers, first is dedicated contract hauler, rest trade.
-            # With only 1 hauler, arbitrage earns more — send it to trader_loop instead.
+            # Mining contract: with 2+ free haulers, first is dedicated contract hauler, rest trade.
+            # With only 1 free hauler, arbitrage earns more — send it to trader_loop instead.
             _hauler_symbols.clear()
-            if len(haulers) >= 2:
-                _hauler_symbols.extend(haulers[:1])
-                _trader_symbols.extend(haulers[1:])
-                log(f"[blue]Launching hauler {haulers[0]} as contract hauler"
-                    + (f"; {haulers[1:]} as trader(s)" if haulers[1:] else "") + "[/blue]")
-            else:
-                # Single hauler: trade for income; miners self-deliver contract ore
-                _trader_symbols.extend(haulers)
-                log(f"[blue]Single hauler {haulers[0]} → arbitrage (miners self-deliver for contract)[/blue]")
+            if len(haulers_free) >= 2:
+                _hauler_symbols.extend(haulers_free[:1])
+                _trader_symbols.extend(haulers_free[1:])
+                log(f"[blue]Launching hauler {haulers_free[0]} as contract hauler"
+                    + (f"; {haulers_free[1:]} as trader(s)" if haulers_free[1:] else "") + "[/blue]")
+            elif haulers_free:
+                # Single free hauler: trade for income; miners self-deliver contract ore
+                _trader_symbols.extend(haulers_free)
+                log(f"[blue]Single hauler {haulers_free[0]} → arbitrage (miners self-deliver for contract)[/blue]")
     if siphoners:
         _siphoner_symbols.clear()
         _siphoner_symbols.extend(siphoners)
@@ -4396,10 +4412,8 @@ def work_contract(contract: dict) -> None:
 
     # ── Load ship groups and remove group-assigned ships from normal pools ────
     global _ship_groups
-    # Auto-group from mount types when no manual groups exist (or force=1)
-    auto_group_ships()
-    with _ship_groups_lock:
-        _ship_groups = _load_ship_groups()
+    # Groups were already loaded above (pre-grouping); just clear worker events.
+    # _ship_groups is already set from the pre-grouping step above.
     _group_worker_ready.clear()
 
     # Validate groups: remove ships not in the current fleet
