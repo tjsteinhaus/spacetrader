@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""One-off script: buy a SHIP_SURVEYOR at H52 and navigate it to FD5D.
-Run ONLY while the main daemon is stopped."""
+"""One-off script: buy a SHIP_SURVEYOR at a shipyard waypoint and navigate it to a target.
+Run ONLY while the main daemon is stopped.
+
+NOTE: Update SYSTEM, COMMAND_SHIP, SHIPYARD_WP, and TARGET_WP below for the current
+server reset before running this script.
+"""
 import sys
 import time
 from datetime import datetime, timezone
@@ -15,10 +19,10 @@ import universe as universe_api
 import agent as agent_api
 from client import SpaceTradersError
 
-SYSTEM = "X1-HU91"
-COMMAND_SHIP = "TYLERMASTERY-1"
-H52 = "X1-HU91-H52"
-FD5D = "X1-HU91-FD5D"
+SYSTEM = "X1-GK27"       # UPDATE for each server reset
+COMMAND_SHIP = "MASTERY-1"  # UPDATE for each server reset
+H52 = "X1-GK27-H48"     # UPDATE: shipyard waypoint where SHIP_SURVEYOR is available
+FD5D = "X1-GK27-CD5A"   # UPDATE: target waypoint to park the new surveyor at
 
 
 def wait_for_ship(ship_symbol):
@@ -86,26 +90,26 @@ def ensure_docked(ship_symbol):
 me = agent_api.get_my_agent()
 print(f"Agent: {me['symbol']} | Credits: {me['credits']:,}")
 
-# Step 1: Get TM-1 to H52
-print(f"\n[1] Navigating {COMMAND_SHIP} to H52...")
+# Step 1: Get command ship to the shipyard waypoint
+print(f"\n[1] Navigating {COMMAND_SHIP} to {H52}...")
 navigate_to(COMMAND_SHIP, H52)
 ensure_docked(COMMAND_SHIP)
 
-# Refuel TM-1 while we're here
+# Refuel command ship while we're here
 try:
     r = fleet_api.refuel(COMMAND_SHIP)
     f = r.get("fuel", {})
-    print(f"  Refueled TM-1: {f.get('current')}/{f.get('capacity')}")
+    print(f"  Refueled {COMMAND_SHIP}: {f.get('current')}/{f.get('capacity')}")
 except SpaceTradersError as e:
     print(f"  Refuel skipped: {e}")
 
 # Step 2: Check shipyard
-print(f"\n[2] Querying H52 shipyard...")
+print(f"\n[2] Querying {H52} shipyard...")
 yard = universe_api.get_shipyard(SYSTEM, H52)
 ships = yard.get("ships", [])
 if not ships:
-    print("ERROR: No ship listings at H52 — need a ship physically docked there.")
-    print("Hint: TM-1 should be docked there now. Try again.")
+    print(f"ERROR: No ship listings at {H52} — need a ship physically docked there.")
+    print(f"Hint: {COMMAND_SHIP} should be docked there now. Try again.")
     sys.exit(1)
 
 for s in ships:
@@ -136,17 +140,17 @@ fuel_cap = fuel.get("capacity", 0)
 fuel_cur = fuel.get("current", 0)
 print(f"  Fuel: {fuel_cur}/{fuel_cap}")
 if fuel_cap < 38:
-    print(f"WARNING: Fuel capacity {fuel_cap} may be too low to reach FD5D (dist ~38)!")
+    print(f"WARNING: Fuel capacity {fuel_cap} may be too low to reach {FD5D}!")
 
-# Step 4: Navigate new surveyor to FD5D
-print(f"\n[4] Navigating {new_symbol} to FD5D...")
+# Step 4: Navigate new surveyor to target waypoint
+print(f"\n[4] Navigating {new_symbol} to {FD5D}...")
 navigate_to(new_symbol, FD5D)
 
-# Leave it in orbit at FD5D
+# Leave it in orbit at the target waypoint
 ship = fleet_api.get_ship(new_symbol)
 if ship["nav"]["status"] == "DOCKED":
     fleet_api.orbit(new_symbol)
-    print(f"  {new_symbol} now orbiting FD5D")
+    print(f"  {new_symbol} now orbiting {FD5D}")
 
 print(f"\nDone! {new_symbol} is at FD5D, ready to survey.")
 print("Restart the daemon — it will detect the new surveyor and launch a thread for it.")

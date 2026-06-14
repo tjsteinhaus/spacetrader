@@ -272,33 +272,38 @@ def get_trade_runs(limit: int = 100):
         with db._conn() as con:
             rows = con.execute(
                 """SELECT
-                       trip_id,
-                       ship_symbol,
-                       trade_symbol,
-                       SUM(CASE WHEN type='PURCHASE' THEN units       ELSE 0 END),
-                       SUM(CASE WHEN type='PURCHASE' THEN total_price ELSE 0 END),
-                       SUM(CASE WHEN type='SELL'     THEN total_price ELSE 0 END),
-                       MIN(CASE WHEN type='PURCHASE' THEN timestamp   END)
-                   FROM market_transactions
-                   WHERE trip_id IS NOT NULL
-                   GROUP BY trip_id
+                       mt.trip_id,
+                       mt.ship_symbol,
+                       mt.trade_symbol,
+                       SUM(CASE WHEN mt.type='PURCHASE' THEN mt.units       ELSE 0 END),
+                       SUM(CASE WHEN mt.type='PURCHASE' THEN mt.total_price ELSE 0 END),
+                       SUM(CASE WHEN mt.type='SELL'     THEN mt.total_price ELSE 0 END),
+                       MIN(CASE WHEN mt.type='PURCHASE' THEN mt.timestamp   END),
+                       tt.buy_waypoint,
+                       tt.sell_waypoint
+                   FROM market_transactions mt
+                   LEFT JOIN trade_trips tt ON tt.trip_id = mt.trip_id
+                   WHERE mt.trip_id IS NOT NULL
+                   GROUP BY mt.trip_id
                    ORDER BY COALESCE(
-                       MAX(CASE WHEN type='SELL' THEN timestamp END),
-                       MIN(timestamp)
+                       MAX(CASE WHEN mt.type='SELL' THEN mt.timestamp END),
+                       MIN(mt.timestamp)
                    ) DESC
                    LIMIT ?""",
                 (limit,),
             ).fetchall()
         return [
             {
-                "trip_id":      r[0],
-                "ship_symbol":  r[1],
-                "trade_symbol": r[2],
-                "units":        int(r[3] or 0),
-                "buy_cost":     int(r[4] or 0),
-                "sell_revenue": int(r[5] or 0),
-                "profit":       int(r[5] or 0) - int(r[4] or 0),
-                "timestamp":    r[6],
+                "trip_id":       r[0],
+                "ship_symbol":   r[1],
+                "trade_symbol":  r[2],
+                "units":         int(r[3] or 0),
+                "buy_cost":      int(r[4] or 0),
+                "sell_revenue":  int(r[5] or 0),
+                "profit":        int(r[5] or 0) - int(r[4] or 0),
+                "timestamp":     r[6],
+                "buy_waypoint":  r[7],
+                "sell_waypoint": r[8],
             }
             for r in rows
         ]
@@ -556,10 +561,14 @@ def toggle_auto_buy():
 
 @app.post("/api/settings/command-role/{role}")
 def set_command_role(role: str):
-    if role not in ("idle", "hauler"):
-        raise HTTPException(status_code=400, detail="role must be idle or hauler")
-    db.set_bot_setting("command_ship_role", role)
-    return {"command_ship_role": role}
+    # Normalize: accept case-insensitive input; map "trader" -> "hauler" for UI compatibility
+    normalized = role.lower()
+    if normalized == "trader":
+        normalized = "hauler"
+    if normalized not in ("idle", "hauler"):
+        raise HTTPException(status_code=400, detail="role must be idle, hauler, or trader")
+    db.set_bot_setting("command_ship_role", normalized)
+    return {"command_ship_role": normalized}
 
 
 @app.post("/api/settings/ship-targets")

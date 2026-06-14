@@ -622,7 +622,9 @@ def navigate_with_refuel(ship_symbol: str, destination: str) -> None:
         dx, dy = _get_coords(destination)
         dist_to_dest = ((dx - cx) ** 2 + (dy - cy) ** 2) ** 0.5
 
-        if cur_fuel > dist_to_dest:
+        # Fuel cost in CRUISE mode is max(1, round(distance))
+        fuel_cost_to_dest = max(1, round(dist_to_dest))
+        if cur_fuel >= fuel_cost_to_dest:
             navigate_to(ship_symbol, destination)
             return
 
@@ -1636,8 +1638,6 @@ def upgrade_mining_mounts(ship_symbol: str) -> None:
     if ship.get("nav", {}).get("status") == "IN_TRANSIT":
         ship_log(ship_symbol, f"[dim]in transit — deferring upgrade to next loop[/dim]")
         return
-    if not has_mining_mount(ship):
-        return
     tier = _best_mount_tier(ship)
     if tier >= len(MINING_MOUNT_TIERS) - 1:
         ship_log(ship_symbol, f"[dim]already has best mining mount ({MINING_MOUNT_TIERS[-1]})[/dim]")
@@ -1668,9 +1668,9 @@ def upgrade_mining_mounts(ship_symbol: str) -> None:
     try:
         result = fleet_api.install_mount(ship_symbol, target)
         ag = result.get("agent", {})
-        ship_log(ship_symbol, f"[green]🔩 Installed {target} on ! Credits: {ag.get('credits', 0):,}[/green]")
+        ship_log(ship_symbol, f"[green]🔩 Installed {target} on {ship_symbol}! Credits: {ag.get('credits', 0):,}[/green]")
     except SpaceTradersError as e:
-        ship_log(ship_symbol, f"[dim]Mount upgrade not available ({target} on ): {e}[/dim]")
+        ship_log(ship_symbol, f"[dim]Mount upgrade not available ({target} on {ship_symbol}): {e}[/dim]")
 
 
 def step_scrap_pending() -> None:
@@ -2129,6 +2129,8 @@ def _hauler_loop_inner(
                                             _ag  = _res.get("agent", {})
                                             _earned = _ag.get("credits", 0)
                                             db.record_credits(_earned)
+                                            contract["fulfilled"] = True
+                                            db.upsert_contract(contract, fulfilled_now=True)  # record real fulfillment timestamp
                                             log(f"[green bold]🏆 Contract fulfilled! Credits: {_earned:,}[/green bold]")
                                             discord.send_contract_finish(
                                                 contract,
@@ -2247,6 +2249,8 @@ def _miner_loop_inner(
                                             res = contracts_api.fulfill_contract(cid)
                                             ag = res.get("agent", {})
                                             db.record_credits(ag.get("credits", 0))
+                                            contract["fulfilled"] = True
+                                            db.upsert_contract(contract, fulfilled_now=True)  # record real fulfillment timestamp
                                             log(f"[green bold]🏆 Contract fulfilled! Credits: {ag.get('credits', 0):,}[/green bold]")
                                             contract_done.set()
                                     return
@@ -2436,6 +2440,8 @@ def _miner_loop_inner(
                                         res = contracts_api.fulfill_contract(cid)
                                         ag = res.get("agent", {})
                                         db.record_credits(ag.get("credits", 0))
+                                        contract["fulfilled"] = True
+                                        db.upsert_contract(contract, fulfilled_now=True)  # record real fulfillment timestamp
                                         log(f"[green bold]🏆 Contract fulfilled! Credits: {ag.get('credits', 0):,}[/green bold]")
                                         contract_done.set()
                                 return
@@ -3034,6 +3040,12 @@ def trader_loop(
             import traceback
             ship_log(ship_symbol, f"[red]💥 trader thread crashed: {e} — restarting in 30s[/red]")
             log(f"[dim]{traceback.format_exc()}[/dim]")
+            # Release any route claim this ship held so other traders can use it
+            with _route_lock:
+                leaked = [g for g, s in list(_claimed_routes.items()) if s == ship_symbol]
+                for g in leaked:
+                    _claimed_routes.pop(g, None)
+                    ship_log(ship_symbol, f"[dim]released leaked route claim for {g}[/dim]")
             stop_event.wait(30)
 
 
@@ -4074,8 +4086,6 @@ def fleet_manager_loop(
     CHECK_INTERVAL = 120  # seconds
 
     while not stop_event.wait(CHECK_INTERVAL):
-        if stop_event.is_set():
-            break
         if not _manager_lock.acquire(blocking=False):
             continue  # another management op in progress — skip this tick
         try:
@@ -4383,6 +4393,7 @@ def work_contract(contract: dict) -> None:
         ag = result.get("agent", {})
         log(f"[green]✓ Accepted! Credits: {ag.get('credits', 0):,}[/green]")
         contract["accepted"] = True
+        db.upsert_contract(contract, accepted_now=True)  # record real acceptance timestamp
     discord.send_contract_start(contract)
 
     # Check if already complete (restart edge case)
@@ -4684,6 +4695,7 @@ def work_contract(contract: dict) -> None:
     _last_progress_units  = sum(
         d.get("unitsFulfilled", 0) for d in contract.get("terms", {}).get("deliver", [])
     )
+    _last_progress_ts     = time.monotonic()  # separate clock for stuck detection
     _stuck_warned         = False
     _DISCORD_STATUS_SECS  = int(db.get_bot_setting("discord_status_interval", "300"))  # default 5 min
     _STUCK_SECS           = 1800  # warn if no delivery progress for 30 min
@@ -4719,9 +4731,9 @@ def work_contract(contract: dict) -> None:
             _cur_units = _last_progress_units
         if _cur_units > _last_progress_units:
             _last_progress_units = _cur_units
+            _last_progress_ts    = _now_mono  # reset the dedicated stuck clock
             _stuck_warned = False
-            _last_status_table = _now_mono  # reset so stuck clock restarts
-        elif not _stuck_warned and _now_mono - _last_status_table >= _STUCK_SECS:
+        elif not _stuck_warned and _now_mono - _last_progress_ts >= _STUCK_SECS:
             good_stuck = _contract_good or "?"
             discord.send_stuck(
                 f"No delivery progress on **{good_stuck}** for 30+ min. "

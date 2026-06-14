@@ -500,7 +500,7 @@ def record_ship_cargo(
                 (time.time(), ship_symbol, waypoint_symbol, nav_status,
                  cargo_units, cargo_capacity, json.dumps(cargo_goods)),
             )
-            # Keep the last 10,000 rows per ship to avoid unbounded growth
+            # Keep the last 50,000 rows globally to avoid unbounded growth
             con.execute(
                 "DELETE FROM ship_cargo_snapshots WHERE id NOT IN "
                 "(SELECT id FROM ship_cargo_snapshots ORDER BY id DESC LIMIT 50000)"
@@ -647,10 +647,13 @@ def upsert_market_prices(
             )
 
 
-def upsert_contract(contract: dict[str, Any], path: Path | str | None = None) -> None:
+def upsert_contract(contract: dict[str, Any], path: Path | str | None = None,
+                    accepted_now: bool = False, fulfilled_now: bool = False) -> None:
     """
     Upsert a contract and its deliverables from a contracts_api response dict.
-    accepted_at and fulfilled_at are set once on first transition and never overwritten.
+    accepted_at and fulfilled_at are preserved via COALESCE (never overwritten once set).
+    Pass accepted_now=True only when this process is actively accepting the contract so
+    the timestamp reflects the real acceptance time rather than a future reload time.
     """
     now = time.time()
     cid = contract.get("id", "")
@@ -658,8 +661,11 @@ def upsert_contract(contract: dict[str, Any], path: Path | str | None = None) ->
         return
     terms = contract.get("terms", {})
     payment = terms.get("payment", {})
-    accepted_at  = now if contract.get("accepted")  else None
-    fulfilled_at = now if contract.get("fulfilled") else None
+    # Only record the timestamp if we are actively performing the transition right now.
+    # On passive loads (e.g. after a restart) we pass neither flag and let COALESCE
+    # preserve whatever timestamp was previously recorded in the DB.
+    accepted_at  = now if accepted_now  else None
+    fulfilled_at = now if fulfilled_now else None
     with _conn(path) as con:
         con.execute(
             """INSERT INTO contracts

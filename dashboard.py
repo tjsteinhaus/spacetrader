@@ -1123,15 +1123,16 @@ class UniverseScreen(Screen):
             f"  Traits:  {', '.join(traits) or '—'}",
             "",
         ]
-        # Mining
+        # Mining — use a single connection for all trait lookups
         mineable: dict[str, list[str]] = {}
-        for trait in traits:
+        if traits:
             with db._conn() as con:
-                goods = con.execute(
-                    "SELECT trade_symbol FROM deposit_goods WHERE trait_symbol = ?",
-                    (trait,),
+                placeholders = ",".join("?" * len(traits))
+                goods_rows = con.execute(
+                    f"SELECT trait_symbol, trade_symbol FROM deposit_goods WHERE trait_symbol IN ({placeholders})",
+                    traits,
                 ).fetchall()
-            for (g,) in goods:
+            for (trait, g) in goods_rows:
                 mineable.setdefault(g, []).append(trait)
         if mineable:
             lines.append("[bold green]⛏  Mineable goods:[/bold green]")
