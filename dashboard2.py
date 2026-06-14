@@ -218,6 +218,35 @@ def _ship_role_label(ship: dict) -> str:
     return f"{sym}  [{role}]"
 
 
+_ROLE_ORDER = {"command": 0, "hauler": 1, "miner": 2, "siphoner": 3, "surveyor": 4}
+_ROLE_COLORS = {
+    "command":  "bright_cyan",
+    "hauler":   "yellow",
+    "miner":    "green",
+    "siphoner": "bright_blue",
+    "surveyor": "magenta",
+}
+
+
+def _get_ship_role(ship: dict) -> tuple[str, str]:
+    """Return (role_label, rich_color) based on ship mounts/frame."""
+    mounts    = [m.get("symbol", "") for m in ship.get("mounts", [])]
+    frame_sym = ship.get("frame", {}).get("symbol", "")
+    if any("GAS_SIPHON" in m for m in mounts):
+        role = "siphoner"
+    elif any("MINING_LASER" in m for m in mounts):
+        role = "miner"
+    elif any("SURVEYING" in m for m in mounts):
+        role = "surveyor"
+    elif "LIGHT_HAULER" in frame_sym or "HEAVY_FREIGHTER" in frame_sym:
+        role = "hauler"
+    elif "COMMAND" in frame_sym:
+        role = "command"
+    else:
+        role = frame_sym.removeprefix("FRAME_").replace("_", " ").title().lower()
+    return role, _ROLE_COLORS.get(role, "white")
+
+
 def _calc_cph() -> tuple[int, int]:
     now = time.time()
     try:
@@ -733,10 +762,12 @@ class MissionControlScreen(Screen):
             f"[dim]System: {SYSTEM}[/dim]"
         )
 
-        # Fleet table
+        # Fleet table — sorted and grouped by role
         t = self.query_one("#mc-fleet-table", DataTable)
         t.clear()
-        for ship in ships:
+        ships_sorted = sorted(ships, key=lambda s: (_ROLE_ORDER.get(_get_ship_role(s)[0], 99), s.get("symbol", "")))
+        current_role_group: str | None = None
+        for ship in ships_sorted:
             sym   = ship.get("symbol", "?")
             nav   = ship.get("nav", {})
             cargo = ship.get("cargo", {})
@@ -750,19 +781,20 @@ class MissionControlScreen(Screen):
             dst_sym    = route.get("destination", {}).get("symbol", "—") if status_str == "IN_TRANSIT" else "—"
             eta_str    = _eta_str(route.get("arrival")) if status_str == "IN_TRANSIT" else ("—" if cd == 0 else f"cd:{cd}s")
 
-            # Derive role from mounts
-            mounts = [m.get("symbol","") for m in ship.get("mounts",[])]
-            if any("SURVEYING" in m for m in mounts):
-                role = Text("surveyor", style="magenta")
-            elif any("MINING_LASER" in m for m in mounts):
-                role = Text("miner", style="green")
-            else:
-                role = Text("hauler/cmd", style="yellow")
+            role_str, role_color = _get_ship_role(ship)
+            if role_str != current_role_group:
+                current_role_group = role_str
+                grp_label = "COMMAND" if role_str == "command" else f"{role_str.upper()}S"
+                _e = Text("", style="dim")
+                t.add_row(
+                    Text(f"── {grp_label} ──", style=f"bold {role_color}"),
+                    _e, _e, _e, _e, _e, _e, _e, _e,
+                )
 
             short = sym.split("-")[-1] if "-" in sym else sym
             t.add_row(
                 Text(f"{_ship_icon(ship)} …-{short}", style="bold cyan"),
-                role,
+                Text(role_str, style=role_color),
                 _nav_status_text(status_str),
                 Text(dep_sym.split("-")[-1] if dep_sym != "—" else "—", style="dim"),
                 Text(dst_sym.split("-")[-1] if dst_sym != "—" else loc.split("-")[-1], style="yellow"),
@@ -900,7 +932,7 @@ class FleetScreen2(Screen):
 
         t = self.query_one("#fleet2-table", DataTable)
         t.add_columns(
-            "Ship", "Frame", "Status", "Location",
+            "Ship", "Role", "Status", "Location",
             "From", "→ Destination", "Mode",
             "Fuel", "Cargo", "ETA", "Cooldown",
         )
@@ -928,25 +960,35 @@ class FleetScreen2(Screen):
         self._all_ships = ships
         t = self.query_one("#fleet2-table", DataTable)
         t.clear()
-        self._ships_map = {}
-        for ship in ships:
+        self._ships_map = {s.get("symbol", "?"): s for s in ships}
+        ships_sorted = sorted(ships, key=lambda s: (_ROLE_ORDER.get(_get_ship_role(s)[0], 99), s.get("symbol", "")))
+        current_role_group: str | None = None
+        for ship in ships_sorted:
             sym   = ship.get("symbol", "?")
-            self._ships_map[sym] = ship
             nav   = ship.get("nav", {})
             cargo = ship.get("cargo", {})
             fuel  = ship.get("fuel", {})
             cd    = ship.get("cooldown", {}).get("remainingSeconds", 0)
-            frame_sym  = ship.get("frame", {}).get("symbol", "")
-            ship_type  = frame_sym.removeprefix("FRAME_").replace("_", " ").title()
             route      = nav.get("route", {})
             status_str = nav.get("status", "?")
             mode_str   = nav.get("flightMode", "CRUISE")
             dep_sym    = route.get("departure",   {}).get("symbol", "—") if status_str == "IN_TRANSIT" else "—"
             dst_sym    = route.get("destination", {}).get("symbol", "—") if status_str == "IN_TRANSIT" else "—"
             eta_str    = _eta_str(route.get("arrival")) if status_str == "IN_TRANSIT" else "—"
+
+            role_str, role_color = _get_ship_role(ship)
+            if role_str != current_role_group:
+                current_role_group = role_str
+                grp_label = "COMMAND" if role_str == "command" else f"{role_str.upper()}S"
+                _e = Text("", style="dim")
+                t.add_row(
+                    Text(f"── {grp_label} ──", style=f"bold {role_color}"),
+                    _e, _e, _e, _e, _e, _e, _e, _e, _e, _e,
+                )
+
             t.add_row(
                 Text(f"{_ship_icon(ship)} {sym}", style="bold cyan"),
-                Text(ship_type, style="magenta"),
+                Text(role_str, style=role_color),
                 _nav_status_text(status_str),
                 Text(nav.get("waypointSymbol", "?"), style="yellow"),
                 Text(dep_sym, style="dim"),

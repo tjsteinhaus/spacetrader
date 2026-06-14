@@ -49,11 +49,10 @@ Stage 6  ───────────────────────�
 
 | Credits | Action | Unlocks |
 |---------|--------|---------|
-| ~0 | Register → first contract | Command Frigate mines |
-| ~100k | **Buy Surveyor** | +30% extraction yield |
-| ~220k | **Buy Hauler #1** | Contract delivery freed; command frigate stays mining |
-| ~370k | **Buy Hauler #2** | First arbitrage trader online |
-| ~520k | **Buy Hauler #3** | 2 traders running — arbitrage credit engine at full speed |
+| ~0 | Register → first contract | Command Frigate does contract buy/deliver |
+| ~100k | **Buy Hauler #1** | First arbitrage trader online; command frigate still on contracts |
+| ~220k | **Buy Hauler #2** | 2 traders running — credit engine starts |
+| ~370k | **Buy Hauler #3** | 3rd trader OR seeds miner/siphon team hauler |
 | ~650k | **Buy Ore Hound #1** | Dedicated 600-fuel miner; no drift risk |
 | ~750k+ | Scale miners | More Ore Hounds (→4), Surveyor #2, Siphon Drones if safe |
 | ~1M | **Deploy Probe Network** | Live prices at every market; unlock Stage 3 |

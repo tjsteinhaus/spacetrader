@@ -55,12 +55,32 @@ def _ship_color(ship_symbol: str) -> str:
     except (ValueError, IndexError):
         return "white"
 
+def _ship_group_tag(ship_symbol: str) -> str:
+    """Return '(T1)', '(T2)', etc. if ship is in a group, else ''."""
+    with _ship_groups_lock:
+        groups = list(_ship_groups)
+    for i, g in enumerate(groups, 1):
+        if ship_symbol == g.get("hauler") or ship_symbol in g.get("workers", []):
+            return f"(T{i})"
+    return ""
+
+def _ship_label(ship_symbol: str) -> str:
+    """Return a concise display label for a ship, e.g. 'Siphoner-9 (T1)'."""
+    suffix = ship_symbol.rsplit("-", 1)[-1]  # e.g. "4", "1C", "B"
+    role = _ship_role_tag.get(ship_symbol, "")
+    grp = _ship_group_tag(ship_symbol)
+    if role:
+        base = f"{role}-{suffix}"
+        return f"{base} {grp}" if grp else base
+    return ship_symbol  # fallback to full symbol before roles are assigned
+
 def ship_log(ship_symbol: str, msg: str) -> None:
-    """Log a message prefixed with the ship's color-coded symbol."""
+    """Log a message prefixed with the ship's color-coded role label."""
     color = _ship_color(ship_symbol)
     ts = datetime.now().strftime("%H:%M:%S")
-    console.print(f"[dim]{ts}[/dim] [{color}]{ship_symbol}[/{color}] {msg}")
-    db.write_log(f"{ts} {ship_symbol} {msg}")
+    label = _ship_label(ship_symbol)
+    console.print(f"[dim]{ts}[/dim] [{color}]{label}[/{color}] {msg}")
+    db.write_log(f"{ts} {label} {msg}")
 
 # ── Market price cache (populated at runtime) ─────────────────────────────────
 _market_cache: dict[str, dict[str, int]] = {}   # {wp: {good: sell_price}}
@@ -98,6 +118,12 @@ _trader_symbols:   list[str] = []   # symbols of ships running trader_loop
 _ship_groups: list[dict] = []
 _ship_groups_lock = threading.Lock()
 
+# ── Per-ship role tags (set when threads start, used by ship_log) ─────────────
+# Value is a short label like "Siphoner", "Trader", "Surveyor", etc.
+# Group context (e.g. "T1", "T2") is appended for siphon/miner group members.
+_ship_role_tag: dict[str, str] = {}
+_ship_no_sensor_logged: set[str] = set()  # suppress repeat "no sensor array" messages
+
 # Per-worker event: worker sets this when its cargo is full, hauler clears it after transfer.
 # Keys are worker ship symbols.
 _group_worker_ready: dict[str, threading.Event] = {}
@@ -130,7 +156,20 @@ def auto_group_ships() -> None:
     force    = db.get_bot_setting("auto_group_ships", "0") == "1"
     existing = _load_ship_groups()
     if existing and not force:
-        return  # manual groups exist — don’t override
+        # Rebuild if any siphon/miner workers are ungrouped
+        _all_ships_chk = fleet_api.get_my_ships()
+        _cur_siphoners = set(
+            s["symbol"] for s in _all_ships_chk
+            if has_siphon_mount(s) and s["symbol"] != FLEET_MANAGER_SHIP
+        )
+        _cur_miners_chk = set(
+            s["symbol"] for s in _all_ships_chk
+            if has_mining_mount(s) and s["symbol"] not in (FLEET_MANAGER_SHIP, COMMAND_SHIP)
+        )
+        _grouped_ws = set(w for g in existing for w in g.get("workers", []))
+        if _cur_siphoners <= _grouped_ws and _cur_miners_chk <= _grouped_ws:
+            return  # all workers already grouped
+        log("[cyan]auto_group_ships: ungrouped workers found - rebuilding[/cyan]")
 
     all_ships = fleet_api.get_my_ships()
 
@@ -156,12 +195,15 @@ def auto_group_ships() -> None:
         return
 
     groups: list[dict]   = []
-    remaining = list(haulers)
+    # Always reserve at least 1 hauler free for contract work / trading.
+    # Use at most (len(haulers) - 1) haulers for groups, capped by team limits.
+    max_group_haulers = max(0, len(haulers) - 1)
+    remaining = list(haulers[:max_group_haulers]) if max_group_haulers > 0 else []
 
     # ── Siphon groups ─────────────────────────────────────────────────────────────
     if siphon_workers and remaining:
         n = max(1, (len(siphon_workers) + 2) // 3)  # 1 hauler per ~3 workers
-        n = min(n, len(remaining))
+        n = min(n, len(remaining), MAX_SIPHON_TEAMS)  # respect team cap
         s_haulers  = remaining[:n]
         remaining  = remaining[n:]
         for i, hauler in enumerate(s_haulers):
@@ -177,7 +219,7 @@ def auto_group_ships() -> None:
     # ── Miner groups ──────────────────────────────────────────────────────────────
     if miner_workers and remaining:
         n = max(1, (len(miner_workers) + 2) // 3)
-        n = min(n, len(remaining))
+        n = min(n, len(remaining), MAX_MINER_TEAMS)  # respect team cap
         m_haulers  = remaining[:n]
         for i, hauler in enumerate(m_haulers):
             my_workers = [w for j, w in enumerate(miner_workers) if j % n == i]
@@ -293,9 +335,9 @@ SHIP_SCORES = {
     "SHIP_SIPHON_DRONE":    55,  # Gas siphoner — fill siphon team slots
     "SHIP_PROBE":           20,  # Scout/charter — buy when wealthy (>1M cr), explore all systems
     "SHIP_ORE_HOUND":       15,  # Miner — lower priority until groups prove out
+    "SHIP_COMMAND_FRIGATE": 45,  # 2nd frigate for refinery scouting — bought at 1.5M cr
     "SHIP_SURVEYOR":        -1,  # Never buy
     "SHIP_HEAVY_FREIGHTER": -1,  # Never buy
-    "SHIP_COMMAND_FRIGATE": -1,  # Already have one
     "SHIP_GAS_DRONE":       -1,  # Never buy
     "SHIP_LIGHT_SHUTTLE":   -1,  # Never buy
 }
@@ -303,9 +345,9 @@ SHIP_SCORES = {
 # ── Team composition targets (hardcoded) ────────────────────────────────────────────
 PRODUCERS_PER_TEAM_TARGET = 5   # workers to fill one team before seeding a new one
 HAULERS_PER_TEAM_TARGET   = 1   # haulers per active team (currently always 1)
-MAX_TRADERS               = 3   # free (non-group) haulers dedicated to arbitrage
+MAX_TRADERS               = None  # auto: max(1, len(_known_markets) // 5) — set dynamically at runtime
 PROBE_CREDIT_THRESHOLD    = 1_000_000  # don't buy probes until we have this many credits
-MAX_PROBES                = 10  # max probe fleet (one per reachable system)
+MAX_PROBES                = None  # auto: len(_known_markets) — one probe per known market
 MAX_SIPHON_TEAMS          = 2   # maximum concurrent siphon teams
 MAX_MINER_TEAMS           = 2   # maximum concurrent miner teams
 
@@ -419,7 +461,9 @@ def wait_cooldown(ship_symbol: str) -> None:
             remaining = cd.get("remainingSeconds", 0) if isinstance(cd, dict) else 0
             if remaining <= 0:
                 return
-            ship_log(ship_symbol, f"[yellow]🌡 cooldown {remaining}s[/yellow]")
+            # Only log at start and when ≤15s remain to avoid repeated countdown spam
+            if remaining > 15:
+                ship_log(ship_symbol, f"[yellow]🌡 cooldown {remaining}s[/yellow]")
             time.sleep(min(remaining, 10))
         except SpaceTradersError as e:
             if e.code == 204 or "no cooldown" in str(e).lower():
@@ -462,8 +506,7 @@ def navigate_to(ship_symbol: str, destination: str) -> None:
                 ship_log(ship_symbol, f"[dim]restored CRUISE mode after in-transit wait[/dim]")
             return
     if ship["nav"]["waypointSymbol"] == destination:
-        ship_log(ship_symbol, f"[dim]already at {destination}[/dim]")
-        return
+        return  # already here — no log needed
 
     # ── Inter-system travel ───────────────────────────────────────────────────
     dest_system = _system_of(destination)
@@ -519,21 +562,26 @@ def navigate_to(ship_symbol: str, destination: str) -> None:
             ship_log(ship_symbol, f"[dim]4236: re-orbiting and retrying after short wait...[/dim]")
             fleet_api.orbit(ship_symbol)
             time.sleep(1)  # give server time to propagate orbit state
-            fleet_api.navigate(ship_symbol, destination)
-            wait_for_ship(ship_symbol)
+            # Use navigate_to (not raw API) so fuel checks still apply on the retry
+            navigate_to(ship_symbol, destination)
             return
         if e.code == 4203:  # insufficient fuel — try local refuel first, then DRIFT
             ship_log(ship_symbol, f"[yellow]⚠ insufficient fuel for {destination} — attempting local refuel[/yellow]")
+            _fuel_before = ship["fuel"].get("current", 0)
             try:
                 ensure_docked(ship_symbol)
                 refuel_if_needed(ship_symbol, threshold=100_000)
-                fleet_api.orbit(ship_symbol)
-                fleet_api.navigate(ship_symbol, destination)
-                wait_for_ship(ship_symbol)
-                return
             except SpaceTradersError:
                 pass
+            # Only retry navigate if refuel actually added fuel; refuel_if_needed
+            # logs silently on failure (no exception), so we must check fuel level.
+            _ship_after = fleet_api.get_ship(ship_symbol)
+            if _ship_after["fuel"].get("current", 0) > _fuel_before:
+                navigate_to(ship_symbol, destination)
+                return
             ship_log(ship_symbol, f"[red]⚠ no fuel available locally, emergency DRIFT to {destination}[/red]")
+            # Must orbit before navigating — ship was docked by ensure_docked above.
+            ensure_orbit(ship_symbol)
             fleet_api.patch_nav(ship_symbol, "DRIFT")
             try:
                 fleet_api.navigate(ship_symbol, destination)
@@ -1178,6 +1226,7 @@ def auto_configure() -> None:
         SYSTEM             = f"{parts[0]}-{parts[1]}"
         COMMAND_SHIP       = f"{callsign}-1"
         FLEET_MANAGER_SHIP = f"{callsign}-2"
+        _ship_role_tag[FLEET_MANAGER_SHIP] = "FleetMgr"
         log(f"[cyan]Agent: {callsign} | HQ: {hq} | System: {SYSTEM}[/cyan]")
     except SpaceTradersError as e:
         log(f"[yellow]auto_configure: agent query failed ({e}) — keeping defaults[/yellow]")
@@ -1186,6 +1235,10 @@ def auto_configure() -> None:
     # ── Load from DB if this callsign was already configured ──────────────────
     db.init_db()   # ensure schema exists before reading config
     saved = db.load_agent_config(callsign)
+    # Invalidate config from a previous reset if the saved waypoints belong to a different system
+    if saved.get("ASTEROID") and not saved["ASTEROID"].startswith(SYSTEM + "-"):
+        log(f"[yellow]Saved config is from a different system ({saved['ASTEROID']}) — discarding, re-detecting...[/yellow]")
+        saved = {}
     if saved.get("ASTEROID"):
         ASTEROID       = saved["ASTEROID"]
         ASTEROID_BASE  = saved.get("ASTEROID_BASE", ASTEROID_BASE)
@@ -1846,6 +1899,7 @@ def _surveyor_loop_inner(
     stop_event: threading.Event,
 ) -> None:
     good = contract["terms"]["deliver"][0]["tradeSymbol"]
+    _ship_role_tag[ship_symbol] = "Surveyor"
     ship_log(ship_symbol, f"[magenta]🔭 surveyor thread started[/magenta]")
 
     # Wait briefly for the lead miner to call choose_mining_target (race condition:
@@ -1983,6 +2037,7 @@ def _hauler_loop_inner(
     good        = d["tradeSymbol"]
     delivery_wp = d["destinationSymbol"]
 
+    _ship_role_tag[ship_symbol] = "Hauler"
     ship_log(ship_symbol, f"[blue]🚛 hauler thread started | contract good: {good}[/blue]")
 
     # Preflight: fuel up at base then head to asteroid
@@ -2140,6 +2195,7 @@ def _miner_loop_inner(
     # Shared surveys are generated at the default ASTEROID; skip them if we're mining elsewhere.
     _use_shared_surveys = (mining_target == ASTEROID)
 
+    _ship_role_tag[ship_symbol] = "Miner"
     ship_log(ship_symbol, f"[cyan]⚓ thread started | mining: {good} → {delivery_wp}[/cyan]")
 
     # Safe startup: if not near the asteroid or fuel < 50%, refuel at ASTEROID_BASE first
@@ -2624,6 +2680,7 @@ def siphon_loop(
     stop_event: threading.Event,
 ) -> None:
     """Siphon gas from gas giants and sell at the best nearby market."""
+    _ship_role_tag[ship_symbol] = "Siphoner"
     ship_log(ship_symbol, f"[blue]🌀 siphon thread started[/blue]")
     while not stop_event.is_set():
         try:
@@ -2754,7 +2811,8 @@ def siphon_hauler_loop(
     stop_event: threading.Event,
 ) -> None:
     """Tender hauler: parks at gas giant, collects cargo from siphon drones, sells it."""
-    ship_log(ship_symbol, f"[cyan]🚢 siphon-hauler thread started (workers: {workers})[/cyan]")
+    _ship_role_tag[ship_symbol] = "SiphHauler"
+    ship_log(ship_symbol, f"[cyan]🚢 siphon-hauler thread started (workers: {[s.rsplit('-',1)[-1] for s in workers]})[/cyan]")
     while not stop_event.is_set():
         try:
             _siphon_hauler_inner(ship_symbol, workers, stop_event)
@@ -2864,7 +2922,8 @@ def miner_hauler_loop(
     stop_event: threading.Event,
 ) -> None:
     """Tender hauler: parks at asteroid, collects ore from mining drones, sells it."""
-    ship_log(ship_symbol, f"[cyan]🚢 miner-hauler thread started (workers: {workers})[/cyan]")
+    _ship_role_tag[ship_symbol] = "MineHauler"
+    ship_log(ship_symbol, f"[cyan]🚢 miner-hauler thread started (workers: {[s.rsplit('-',1)[-1] for s in workers]})[/cyan]")
     while not stop_event.is_set():
         try:
             _miner_hauler_inner(ship_symbol, workers, stop_event)
@@ -2966,6 +3025,7 @@ def trader_loop(
     stop_event: threading.Event,
 ) -> None:
     """Buy low / sell high using market arbitrage within the system."""
+    _ship_role_tag[ship_symbol] = "Trader"
     ship_log(ship_symbol, f"[magenta]💹 trader thread started[/magenta]")
     while not stop_event.is_set():
         try:
@@ -3532,7 +3592,36 @@ def explorer_loop(
             stop_event.wait(30)
 
 
+def _probe_market_patrol(ship_symbol: str, stop_event: threading.Event) -> None:
+    """Park at one assigned market and keep refreshing prices. Used for probes with no sensor array."""
+    ship_log(ship_symbol, f"[dim]🌌 switching to market-patrol mode[/dim]")
+
+    # Pick a permanent home market based on probe index so they spread evenly
+    markets = list(_known_markets or [ASTEROID_BASE])
+    n_probes = max(len(_explorer_symbols), 1)
+    idx = _explorer_symbols.index(ship_symbol) if ship_symbol in _explorer_symbols else 0
+    offset = (idx * max(1, len(markets) // n_probes)) % len(markets)
+    home_market = markets[offset]
+
+    # Navigate once, then stay docked and keep refreshing
+    try:
+        navigate_to(ship_symbol, home_market)
+        ensure_docked(ship_symbol)
+        ship_log(ship_symbol, f"[dim]🌌 parked at {home_market} — refreshing prices[/dim]")
+    except Exception as e:
+        ship_log(ship_symbol, f"[yellow]🌌 could not reach {home_market}: {e}[/yellow]")
+
+    while not stop_event.is_set():
+        try:
+            _market_cache_ts.pop(home_market, None)
+            get_market_prices(home_market)
+        except Exception:
+            pass
+        stop_event.wait(MARKET_CACHE_TTL)
+
+
 def _explorer_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
+    _ship_role_tag[ship_symbol] = "Explorer"
     ship_log(ship_symbol, f"[blue]🌌 explorer thread started[/blue]")
 
     # Make sure explorer is in the home system before starting sweeps
@@ -3558,6 +3647,10 @@ def _explorer_loop_inner(ship_symbol: str, stop_event: threading.Event) -> None:
             try:
                 scan_result = fleet_api.scan_systems(ship_symbol)
             except SpaceTradersError as e:
+                if e.code == 4215:  # no sensor array — this is a probe, switch to patrol mode
+                    _ship_no_sensor_logged.add(ship_symbol)
+                    _probe_market_patrol(ship_symbol, stop_event)
+                    return  # patrol loop runs until stop_event; then this thread exits cleanly
                 log(f"[yellow]Explorer: system scan failed: {e}[/yellow]")
                 stop_event.wait(EXPLORER_REST_SECS)
                 continue
@@ -3713,10 +3806,11 @@ def _bg_buy_and_launch(
             return False
         if stype == "SHIP_SURVEYOR" and current_surveyors >= 2:
             return False
-        if stype in ("SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER") and current_haulers >= 3:
+        _auto_max_traders = max(1, len(_known_markets) // 5) if _known_markets else 3
+        _hauler_cap = MAX_SIPHON_TEAMS + MAX_MINER_TEAMS + _auto_max_traders
+        if stype in ("SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER") and current_haulers >= _hauler_cap:
             return False
-        if stype == "SHIP_COMMAND_FRIGATE" and _explorer_symbols:
-            return False
+        # SHIP_COMMAND_FRIGATE: ship_score() enforces the 1.5M credit gate; no static block here
         return True
 
     # Short-circuit: if every fleet cap is already met, no point touring.
@@ -3975,6 +4069,7 @@ def fleet_manager_loop(
     """Daemon thread: every 2 min, buy affordable ships, negotiate contracts,
     and scan unvisited/stale markets to keep arbitrage data fresh.
     """
+    _ship_role_tag[FLEET_MANAGER_SHIP] = "FleetMgr"
     log("[dim]⚙  Fleet manager thread started[/dim]")
     CHECK_INTERVAL = 120  # seconds
 
@@ -4318,6 +4413,11 @@ def work_contract(contract: dict) -> None:
         and s["symbol"] not in miners
         and s["symbol"] != FLEET_MANAGER_SHIP
     ]
+    probes = [
+        s["symbol"] for s in all_fleet
+        if s["frame"].get("symbol", "") == "FRAME_PROBE"
+        and s["symbol"] != FLEET_MANAGER_SHIP
+    ]
     # Optionally run the command ship as a hauler if the user set command_ship_role=hauler
     if db.get_bot_setting("command_ship_role", "idle") == "hauler" and FLEET_MANAGER_SHIP not in haulers:
         haulers.append(FLEET_MANAGER_SHIP)
@@ -4362,31 +4462,27 @@ def work_contract(contract: dict) -> None:
                 "payment": contract["terms"]["payment"],
             },
         }
-        if len(haulers_free) >= 2:
-            # Assign the first free hauler as the dedicated contract buyer — larger fuel
-            # tank and potential jump drive make it better suited for long buy routes.
+        # Always use the command ship (miner) for contract buying so all Light Haulers can trade.
+        miners_free = [m for m in miners if m not in _pre_grouped_workers]
+        if miners_free:
+            _contract_buyer_miner = miners_free[0]
+            _contract_buyer = _contract_buyer_miner
+            _haulers_for_buy = []
+            _haulers_for_trade = haulers_free   # ALL free haulers do arbitrage
+            _contract_buy_ships.add(_contract_buyer_miner)
+            log(f"[cyan]Direct-buy contract: {_contract_buyer_miner} handles buy/deliver; "
+                f"{len(haulers_free)} hauler(s) do arbitrage[/cyan]")
+        elif haulers_free:
+            # No free miners (all grouped) — fall back to first hauler for contract
             _contract_buyer = haulers_free[0]
             _haulers_for_buy = [haulers_free[0]]
             _haulers_for_trade = haulers_free[1:]
-            log(f"[cyan]Direct-buy contract: hauler {_contract_buyer} handles buy/deliver; "
-                f"{len(miners)} miner(s) mine for income[/cyan]")
-        elif haulers_free:
-            # Only 1 free hauler — arbitrage earns more; let miner handle the contract buy/deliver.
-            _contract_buyer = miners[0]
-            _haulers_for_buy = []
-            _haulers_for_trade = haulers_free  # single hauler does arbitrage
-            _contract_buy_ships.add(miners[0])
-            log(f"[cyan]Direct-buy contract: {miners[0]} handles buy/deliver; "
-                f"single hauler {haulers_free[0]} does arbitrage[/cyan]")
+            log(f"[cyan]Direct-buy contract: hauler {haulers_free[0]} handles buy/deliver "
+                f"(no free miners — all grouped)[/cyan]")
         else:
-            # No free hauler available — fall back to first miner doing the run.
-            _contract_buyer = miners[0]
-            _haulers_for_buy = []
-            _haulers_for_trade = []
-            # Mark this miner as a forced buyer so _miner_loop_inner skips mining
-            _contract_buy_ships.add(miners[0])
-            log(f"[cyan]Direct-buy contract: {miners[0]} handles buy/deliver (no hauler available); "
-                f"{len(miners)-1} miner(s) mine for income[/cyan]")
+            # No free miners and no free haulers — fall back to mining normally.
+            _mine_only_contract = None
+            log(f"[yellow]Direct-buy contract: all miners grouped and no free hauler — falling back to mine contract[/yellow]")
     else:
         _mine_only_contract = None  # all miners work the real contract
 
@@ -4417,6 +4513,11 @@ def work_contract(contract: dict) -> None:
         _siphoner_symbols.clear()
         _siphoner_symbols.extend(siphoners)
         log(f"[blue]Launching {len(siphoners)} siphoner thread(s): {siphoners}[/blue]")
+    if probes:
+        new_probes = [p for p in probes if p not in _explorer_symbols]
+        _explorer_symbols.extend(new_probes)
+        if new_probes:
+            log(f"[blue]Launching {len(new_probes)} probe explorer thread(s): {new_probes}[/blue]")
 
     # ── Load ship groups and remove group-assigned ships from normal pools ────
     # Groups were already loaded above (pre-grouping); just clear worker events.
@@ -4556,6 +4657,16 @@ def work_contract(contract: dict) -> None:
                 for w in _grp_workers
                 if w not in [t.name.split("-", 1)[-1] for t in threads]
             ]
+    # Explorer threads for probes (including those that existed before this run)
+    threads += [
+        threading.Thread(
+            target=explorer_loop,
+            args=(probe, contract, contract_done, stop_event),
+            daemon=True,
+            name=f"explorer-{probe}",
+        )
+        for probe in _explorer_symbols
+    ]
     for t in threads:
         t.start()
 
@@ -4656,6 +4767,7 @@ def ship_score(
     current_miner_count: int,
     current_surveyor_count: int = 0,
     current_hauler_count: int = 0,
+    current_probe_count: int = -1,  # -1 means look it up (only safe outside buy loops)
 ) -> int:
     """
     Score a ship type for purchase priority.  Higher = more desirable to buy.
@@ -4712,7 +4824,8 @@ def ship_score(
             and s["symbol"] not in _grouped_h
             and s["symbol"] != FLEET_MANAGER_SHIP
         )
-        need_trader = free_haulers < MAX_TRADERS
+        _auto_max_traders = max(1, len(_known_markets) // 5) if _known_markets else 3
+        need_trader = free_haulers < _auto_max_traders
         if not need_siphon_hauler and not need_miner_hauler and not need_trader:
             log("[dim]Fleet manager: hauler skipped — all teams full, at cap, and traders at max[/dim]")
             return -1
@@ -4727,9 +4840,15 @@ def ship_score(
             return -1
         if credits < PROBE_CREDIT_THRESHOLD:
             return -1
-        all_ships = fleet_api.get_my_ships()
-        probe_count = sum(1 for s in all_ships if s["frame"].get("symbol") == "FRAME_PROBE")
-        if probe_count >= MAX_PROBES:
+        if current_probe_count < 0:
+            # Fallback: look up live (only used outside buy_ships loops)
+            try:
+                all_ships = fleet_api.get_my_ships()
+                current_probe_count = sum(1 for s in all_ships if s["frame"].get("symbol") == "FRAME_PROBE")
+            except Exception:
+                return -1
+        _auto_max_probes = max(len(_known_markets), 1) if _known_markets else 10
+        if current_probe_count >= _auto_max_probes:
             return -1
         return base
 
@@ -4756,6 +4875,19 @@ def ship_score(
         target_total = min(eff_teams, MAX_SIPHON_TEAMS) * PRODUCERS_PER_TEAM_TARGET
         if len(_siphoner_symbols) >= target_total:
             return -1  # all siphon teams full
+        return base
+
+    if ship_type == "SHIP_COMMAND_FRIGATE":
+        # Buy a 2nd frigate (with jump drive) for refinery scouting once we can afford it.
+        # Stop at 1 — the _should_buy gate blocks this once _explorer_symbols is populated.
+        FRIGATE_CREDIT_THRESHOLD = 1_500_000
+        try:
+            me = agent_api.get_my_agent()
+            credits = me.get("credits", 0)
+        except Exception:
+            return -1
+        if credits < FRIGATE_CREDIT_THRESHOLD:
+            return -1
         return base
 
     return base
@@ -4786,10 +4918,11 @@ def buy_ships() -> int:
     current_haulers   = len([s for s in current_ships
                              if s["registration"]["role"] in ("HAULER", "TRANSPORT")
                              and s["symbol"] != FLEET_MANAGER_SHIP])
+    current_probes    = sum(1 for s in current_ships if s["frame"].get("symbol") == "FRAME_PROBE")
     purchases = 0
 
     def _eligible(stype: str) -> bool:
-        if ship_score(stype, current_miners, current_surveyors, current_haulers) < 0:
+        if ship_score(stype, current_miners, current_surveyors, current_haulers, current_probes) < 0:
             return False
         _role_count = {
             "SHIP_ORE_HOUND":       current_miners,
@@ -4837,7 +4970,7 @@ def buy_ships() -> int:
         t.add_column("Supply")
         t.add_column("Priority", justify="right")
         for s in ships_for_sale:
-            sc = ship_score(s.get("type", ""), current_miners, current_surveyors, current_haulers)
+            sc = ship_score(s.get("type", ""), current_miners, current_surveyors, current_haulers, current_probes)
             price = s.get("purchasePrice", 0)
             can_afford = "[green]✓[/green]" if credits - price >= CREDIT_RESERVE else "[red]✗[/red]"
             priority = str(sc) if sc >= 0 else "[dim]skip[/dim]"
@@ -4847,7 +4980,7 @@ def buy_ships() -> int:
         # Buy greedily in priority order, skipping anything we can't afford
         buyable = sorted(
             [s for s in ships_for_sale if _eligible(s.get("type", ""))],
-            key=lambda s: ship_score(s.get("type", ""), current_miners, current_surveyors, current_haulers),
+            key=lambda s: ship_score(s.get("type", ""), current_miners, current_surveyors, current_haulers, current_probes),
             reverse=True,
         )
 
