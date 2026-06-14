@@ -220,10 +220,23 @@ class Navigator:
         # Intra-system travel
         await self.ensure_orbit(ship_symbol)
         ship = await fleet_api.get_ship(self._client, ship_symbol)
-        if ship["nav"].get("flightMode", "CRUISE") != "CRUISE":
+        cur_fuel = ship.get("fuel", {}).get("current", 0)
+
+        # Use BURN mode if ship has enough fuel for the hop (v1 parity).
+        # Burn costs ~2× cruise fuel but is ~2× faster.
+        dest_coords = await self.get_coords(destination)
+        src_coords  = await self.get_coords(ship["nav"]["waypointSymbol"])
+        dist = ((dest_coords[0] - src_coords[0]) ** 2 + (dest_coords[1] - src_coords[1]) ** 2) ** 0.5
+        burn_cost = round(dist) * 2
+        current_mode = ship["nav"].get("flightMode", "CRUISE")
+        use_burn = cur_fuel >= burn_cost and burn_cost > 0
+
+        if use_burn and current_mode != "BURN":
+            await fleet_api.patch_nav(self._client, ship_symbol, "BURN")
+        elif not use_burn and current_mode != "CRUISE":
             await fleet_api.patch_nav(self._client, ship_symbol, "CRUISE")
 
-        log.info("%s → %s", ship_symbol, destination)
+        log.info("%s → %s%s", ship_symbol, destination, " [BURN]" if use_burn else "")
         try:
             await fleet_api.navigate(self._client, ship_symbol, destination)
         except SpaceTradersError as e:
@@ -234,8 +247,29 @@ class Navigator:
             if e.code == 4203:  # insufficient fuel
                 await self._drift_fallback(ship_symbol, destination)
                 return
+            if e.code == 4236:  # ship not in orbit — re-orbit and retry once
+                log.warning("%s not in orbit (4236) — re-orbiting and retrying", ship_symbol)
+                try:
+                    await fleet_api.orbit(self._client, ship_symbol)
+                except SpaceTradersError:
+                    pass
+                await asyncio.sleep(1)
+                try:
+                    await fleet_api.navigate(self._client, ship_symbol, destination)
+                except SpaceTradersError as e2:
+                    raise e2
+                await self.wait_arrival(ship_symbol)
+                # Restore CRUISE after arrival
+                await fleet_api.patch_nav(self._client, ship_symbol, "CRUISE")
+                return
             raise
         await self.wait_arrival(ship_symbol)
+        # Restore CRUISE after BURN hop
+        if use_burn:
+            try:
+                await fleet_api.patch_nav(self._client, ship_symbol, "CRUISE")
+            except SpaceTradersError:
+                pass
 
     async def _inter_system(
         self,
@@ -256,8 +290,9 @@ class Navigator:
             if current_wp != gate_wp:
                 await self.navigate_to(ship_symbol, gate_wp)
             await self.ensure_orbit(ship_symbol)
-            log.info("%s jumping → %s", ship_symbol, destination)
-            await fleet_api.jump(self._client, ship_symbol, destination)
+            dest_sys = system_of(destination)
+            log.info("%s jumping → %s", ship_symbol, dest_sys)
+            await fleet_api.jump(self._client, ship_symbol, dest_sys)
             await self.wait_arrival(ship_symbol)
             # If jump landed at gate rather than exact destination, navigate the rest
             after = (await fleet_api.get_ship(self._client, ship_symbol))["nav"]["waypointSymbol"]

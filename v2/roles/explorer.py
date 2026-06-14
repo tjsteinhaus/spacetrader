@@ -31,9 +31,26 @@ class ExplorerRole(BaseRole):
 
         while not stop.is_set():
             ship = await self._get_ship()
-            if not any("JUMP_DRIVE" in m.get("symbol", "") for m in ship.get("modules", [])):
-                self.log.warning("No jump drive — explorer idle")
-                await asyncio.sleep(3600)
+            has_jump  = any("JUMP_DRIVE" in m.get("symbol", "") for m in ship.get("modules", []))
+            has_sensor = any("SENSOR" in m.get("symbol", "") for m in ship.get("mounts", []))
+
+            if not has_jump:
+                # No jump drive — fall back to probe market patrol mode (v1 parity).
+                # Pick an assigned market from DB bot_setting or default to asteroid_base,
+                # then continually refresh prices there.
+                import db as _db
+                import time as _time
+                patrol_wp = _db.get_bot_setting(
+                    f"probe_patrol_{self.ship_symbol}", self._cfg.asteroid_base
+                )
+                self.log.info(
+                    "%s has no jump drive — probe patrol mode at %s", self.ship_symbol, patrol_wp
+                )
+                await self._navigate_with_refuel(patrol_wp)
+                await self._ensure_docked()
+                await self._market.get_prices(patrol_wp, force_refresh=True)
+                self.log.info("Probe patrolled %s — sleeping 300s", patrol_wp)
+                await asyncio.sleep(300)
                 continue
 
             # Ensure we have a jump gate to work from
@@ -77,7 +94,7 @@ class ExplorerRole(BaseRole):
 
                     self.log.info("Jumping → %s", target_sys)
                     await self._ensure_orbit()
-                    await fleet_api.jump(self._client, self.ship_symbol, target_wp)
+                    await fleet_api.jump(self._client, self.ship_symbol, target_sys)
                     await self._nav.wait_arrival(self.ship_symbol)
 
                     db.upsert_waypoints(target_wps)
@@ -99,7 +116,7 @@ class ExplorerRole(BaseRole):
 
                     # Return home
                     await self._ensure_orbit()
-                    await fleet_api.jump(self._client, self.ship_symbol, gate_wp)
+                    await fleet_api.jump(self._client, self.ship_symbol, curr_sys)
                     await self._nav.wait_arrival(self.ship_symbol)
 
                 except SpaceTradersError as e:

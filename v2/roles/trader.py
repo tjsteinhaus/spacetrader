@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import uuid
 
 from client import SpaceTradersError
 from api import fleet as fleet_api, agent as agent_api
@@ -23,9 +25,33 @@ from .base import BaseRole
 
 # Trading constants
 TRADER_MIN_MARGIN     = 150
-TRADER_CREDIT_RESERVE = 150_000   # keep this much in reserve for mining/repair ops
+TRADER_MIN_ROI        = 0.10   # minimum 10% ROI for backhaul routes (v1 parity)
+TRADER_CREDIT_RESERVE = 150_000
 TRADER_MIN_UNITS      = 5
-PRICE_FLOOR_RATIO     = 0.10   # stop selling if price drops below 10% of first batch
+PRICE_FLOOR_RATIO     = 0.10
+# Pre-sell recovery: poll up to this many times (each 90s = 30 min total) before selling at a loss
+PRESELL_RECOVERY_POLLS = 20
+PRESELL_POLL_INTERVAL  = 90
+
+_BATCH_LIMIT_RE = re.compile(r"limit of (\d+) units per transaction", re.IGNORECASE)
+
+# Route-claiming: prevents multiple traders from competing on the same good simultaneously.
+# Maps trade_symbol → ship_symbol that owns it. asyncio-safe (single-threaded event loop).
+_claimed_routes: dict[str, str] = {}
+
+
+def claim_route(good: str, ship_symbol: str) -> bool:
+    """Claim a trade route. Returns True if claimed, False if already taken by another ship."""
+    if good in _claimed_routes and _claimed_routes[good] != ship_symbol:
+        return False
+    _claimed_routes[good] = ship_symbol
+    return True
+
+
+def release_route(good: str, ship_symbol: str) -> None:
+    """Release a trade route claim."""
+    if _claimed_routes.get(good) == ship_symbol:
+        del _claimed_routes[good]
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +138,11 @@ class TraderRole(BaseRole):
         # ── Find best arbitrage opportunity ──
         opps = db.get_arbitrage_opportunities(self._cfg.system, min_margin=TRADER_MIN_MARGIN)
         opps = [o for o in opps if o["buy_price"] > 0]
+
+        # Exclude the active contract good so haulers/miners can work it uncontested (v1 parity)
+        if self._ctx and self._ctx.trade_symbol:
+            contract_good = self._ctx.trade_symbol
+            opps = [o for o in opps if o["trade_symbol"] != contract_good]
         if not opps:
             self.log.info("No arbitrage opportunities in DB — refreshing all market prices now")
             for wp in self._market.known_markets or []:
@@ -128,6 +159,12 @@ class TraderRole(BaseRole):
         buy_wp     = best["buy_at"]
         sell_wp    = best["sell_at"]
         cached_buy = best["buy_price"]
+
+        # ── Claim route — skip if another trader already has this good ──
+        if not claim_route(good, self.ship_symbol):
+            self.log.debug("Route %s already claimed by another trader — re-scanning", good)
+            await asyncio.sleep(15)
+            return
 
         # ── Navigate to buy market ──
         await self._navigate_with_refuel(buy_wp)
@@ -158,6 +195,7 @@ class TraderRole(BaseRole):
                 "Margin shrank at %s: %d/u margin (%.0f%% ROI) — re-scanning",
                 buy_wp, live_margin, live_roi * 100,
             )
+            release_route(good, self.ship_symbol)
             return
 
         if live_buy != cached_buy:
@@ -173,10 +211,12 @@ class TraderRole(BaseRole):
                 "Not enough credits/space: can buy %d units of %s @ %d/u — waiting 2min",
                 to_buy, good, live_buy,
             )
+            release_route(good, self.ship_symbol)
             await asyncio.sleep(120)
             return
 
         # ── Buy in batches ──
+        trip_id    = str(uuid.uuid4())
         bought     = 0
         total_cost = 0
         batch_size = 40
@@ -210,13 +250,28 @@ class TraderRole(BaseRole):
                     break
             except SpaceTradersError as e:
                 if e.code in (4227, 4604):  # unit limit per transaction
-                    batch_size = max(1, batch_size // 2)
+                    # Extract exact limit from error message (v1 parity), fall back to halving
+                    m = _BATCH_LIMIT_RE.search(str(e))
+                    batch_size = int(m.group(1)) if m else max(1, batch_size // 2)
                     continue
                 self.log.warning("Buy error: %s", e)
                 break
 
         if bought == 0:
+            release_route(good, self.ship_symbol)
             return
+
+        # ── Re-evaluate sell route after buying (25% better route check — v1 parity) ──
+        opps_after = db.get_arbitrage_opportunities(self._cfg.system, min_margin=0)
+        for o in opps_after:
+            if o["trade_symbol"] == good and o["sell_price"] > live_sell * 1.25:
+                self.log.info(
+                    "Better sell route found after buying: %s (%d/u vs %d/u) — re-routing",
+                    o["sell_at"], o["sell_price"], live_sell,
+                )
+                sell_wp = o["sell_at"]
+                live_sell = o["sell_price"]
+                break
 
         est_profit = bought * (live_sell - live_buy)
         discord.send_trade_start(self.ship_symbol, good, buy_wp, sell_wp, bought, live_buy, est_profit)
@@ -226,14 +281,47 @@ class TraderRole(BaseRole):
         await self._ensure_docked()
         sell_wp_actual = (await self._get_ship())["nav"]["waypointSymbol"]
 
+        # ── Pre-sell: if price is crashed below cost, poll for recovery (v1 parity) ──
+        for _poll in range(PRESELL_RECOVERY_POLLS):
+            live_sell_data = await self._market.get_prices(sell_wp_actual, force_refresh=True)
+            current_sell   = live_sell_data.get(good, 0)
+            if current_sell >= live_buy * 0.85:
+                break  # price acceptable — proceed
+            # Check if any alternative market has a better price
+            alt_wp = None
+            for o in db.get_arbitrage_opportunities(self._cfg.system, min_margin=0):
+                if o["trade_symbol"] == good and o["sell_at"] != sell_wp_actual:
+                    alt_data = await self._market.get_prices(o["sell_at"], force_refresh=True)
+                    if alt_data.get(good, 0) >= live_buy * 0.85:
+                        alt_wp = o["sell_at"]
+                        break
+            if alt_wp:
+                self.log.info("Price at %s crashed — re-routing to %s", sell_wp_actual, alt_wp)
+                await self._navigate_with_refuel(alt_wp)
+                await self._ensure_docked()
+                sell_wp_actual = (await self._get_ship())["nav"]["waypointSymbol"]
+                break
+            self.log.warning(
+                "Sell price %d/u below cost %d/u for %s — waiting %ds for recovery (%d/%d)",
+                current_sell, live_buy, good, PRESELL_POLL_INTERVAL, _poll + 1, PRESELL_RECOVERY_POLLS,
+            )
+            await asyncio.sleep(PRESELL_POLL_INTERVAL)
+
         # ── Sell in batches with price floor ──
         revenue = await self._sell_batched(good, bought, sell_wp_actual, stop, min_sell_price=live_buy)
         discord.send_trade_finish(
             self.ship_symbol, good, buy_wp, sell_wp_actual,
             bought, total_cost, revenue, revenue - total_cost,
         )
+        # Record complete trip for analytics
+        try:
+            db.log_trade_trip(trip_id, self.ship_symbol, good, buy_wp, sell_wp_actual,
+                              bought, total_cost, revenue)
+        except Exception:
+            pass
 
         # ── Backhaul: check if sell market has a good outbound route ──
+        release_route(good, self.ship_symbol)
         await self._try_backhaul(sell_wp_actual, stop)
 
     async def _sell_batched(
@@ -332,6 +420,8 @@ class TraderRole(BaseRole):
         )
 
         # Buy right here (already docked)
+        bh_trip_id = str(uuid.uuid4())
+        bh_cost    = 0
         bought     = 0
         batch_size = 40
         while bought < to_buy and not stop.is_set():
@@ -339,11 +429,14 @@ class TraderRole(BaseRole):
             try:
                 result = await fleet_api.purchase_cargo(self._client, self.ship_symbol, good, chunk)
                 tx = result.get("transaction", {})
-                bought += tx.get("units", chunk)
-                self.log.info("BH Bought %dx %s @ %d/u", tx.get("units", chunk), good, tx.get("pricePerUnit", bh_buy))
+                units_b = tx.get("units", chunk)
+                bought  += units_b
+                bh_cost += tx.get("totalPrice", units_b * bh_buy)
+                self.log.info("BH Bought %dx %s @ %d/u", units_b, good, tx.get("pricePerUnit", bh_buy))
             except SpaceTradersError as e:
-                if e.code == 4227:
-                    batch_size = max(1, batch_size // 2)
+                if e.code in (4227, 4604):
+                    m = _BATCH_LIMIT_RE.search(str(e))
+                    batch_size = int(m.group(1)) if m else max(1, batch_size // 2)
                     continue
                 break
 
@@ -354,4 +447,9 @@ class TraderRole(BaseRole):
         await self._navigate_with_refuel(bh["sell_at"])
         await self._ensure_docked()
         bh_sell_wp = (await self._get_ship())["nav"]["waypointSymbol"]
-        await self._sell_batched(good, bought, bh_sell_wp, stop)
+        bh_revenue = await self._sell_batched(good, bought, bh_sell_wp, stop)
+        try:
+            db.log_trade_trip(bh_trip_id, self.ship_symbol, good, current_wp, bh_sell_wp,
+                              bought, bh_cost, bh_revenue)
+        except Exception:
+            pass

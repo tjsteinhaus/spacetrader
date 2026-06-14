@@ -3,8 +3,7 @@ roles/siphon_hauler.py — SiphonHaulerRole: tender hauler for siphon drone team
 
 The hauler parks at the gas giant and waits for siphon drones to signal
 via asyncio.Events (set by SiphonerRole when cargo is full).  It transfers
-the cargo to itself, then sells everything when full or when all workers are
-idle with no more cargo.
+the cargo to itself, delivers contract good when present, then sells junk.
 """
 from __future__ import annotations
 
@@ -12,13 +11,13 @@ import asyncio
 import logging
 
 from client import SpaceTradersError
-from api import fleet as fleet_api
-from .base import BaseRole
+from api import fleet as fleet_api, contracts as contracts_api
+from .base import BaseRole, ContractContext
 import groups
 
 
 class SiphonHaulerRole(BaseRole):
-    """Tender hauler: parks at gas giant, collects from siphon drones, sells."""
+    """Tender hauler: parks at gas giant, collects from siphon drones, delivers contract good, sells junk."""
 
     def __init__(self, workers: list[str], **kwargs) -> None:
         super().__init__(**kwargs)
@@ -61,6 +60,10 @@ class SiphonHaulerRole(BaseRole):
 
         self.log.info("SiphonHauler heading to gas giant %s", target_gg)
         await self._navigate_with_refuel(target_gg)
+
+        # Contract context (may be None if no contract active)
+        ctx: ContractContext | None = self._ctx
+        good = ctx.trade_symbol if ctx else None
 
         while not stop.is_set():
             hauler_ship  = await self._get_ship()
@@ -114,7 +117,7 @@ class SiphonHaulerRole(BaseRole):
                 # Clear ready flag so worker resumes siphoning
                 evt.clear()
 
-            # Decide whether to sell
+            # Decide whether to deliver/sell
             hauler_ship  = await self._get_ship()
             hauler_cargo = hauler_ship["cargo"]
             hauler_units = hauler_cargo["units"]
@@ -126,11 +129,43 @@ class SiphonHaulerRole(BaseRole):
                 )
                 if hauler_space == 0 or (not workers_have_cargo and not collected):
                     self.log.info(
-                        "Hauler cargo %d/%d — selling",
+                        "Hauler cargo %d/%d — heading to base",
                         hauler_units, hauler_cargo["capacity"],
                     )
-                    # Sell everything then return to gas giant
-                    await self.sell_junk(keep_good=None)
+
+                    # Deliver contract good first if we have any
+                    if ctx and good and not ctx.done.is_set():
+                        have_good = sum(
+                            i["units"] for i in (await self._get_ship())["cargo"].get("inventory", [])
+                            if i["symbol"] == good
+                        )
+                        if have_good > 0:
+                            try:
+                                fc = await contracts_api.get_contract(self._client, ctx.contract_id)
+                                for dt in fc.get("terms", {}).get("deliver", []):
+                                    if dt["tradeSymbol"] == good:
+                                        remaining = dt["unitsRequired"] - dt["unitsFulfilled"]
+                                        if remaining <= 0:
+                                            ctx.done.set()
+                                            break
+                                        to_deliver = min(have_good, remaining)
+                                        await self._navigate_with_refuel(ctx.destination)
+                                        await self._ensure_docked()
+                                        result = await contracts_api.deliver_contract(
+                                            self._client, ctx.contract_id,
+                                            self.ship_symbol, good, to_deliver,
+                                        )
+                                        await self._record_delivery_and_fulfill(result, ctx, good)
+                                        break
+                            except SpaceTradersError as e:
+                                self.log.warning("SiphonHauler delivery error: %s", e)
+
+                    # Try to refuel from FUEL cargo before sell run (v1 parity)
+                    await self._refuel_from_cargo()
+                    await self.refine_cargo_for_sale()
+
+                    # Sell junk (keep contract good safe), then return to gas giant
+                    await self.sell_junk(keep_good=good)
                     await self._navigate_with_refuel(target_gg)
                     continue
 

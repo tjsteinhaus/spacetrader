@@ -118,28 +118,9 @@ class HaulerRole(BaseRole):
                             result = await contracts_api.deliver_contract(
                                 self._client, cid, self.ship_symbol, good, to_deliver
                             )
-                            c = result.get("contract", {})
-                            for dt2 in c.get("terms", {}).get("deliver", []):
-                                if dt2["tradeSymbol"] == good:
-                                    f = dt2["unitsFulfilled"]
-                                    req = dt2["unitsRequired"]
-                                    self.log.info("Hauler: %d/%d %s delivered", f, req, good)
-                                    if f >= req:
-                                        async with ctx.fulfill_lock:
-                                            if not ctx.done.is_set():
-                                                try:
-                                                    res = await contracts_api.fulfill_contract(
-                                                        self._client, cid
-                                                    )
-                                                    ag = res.get("agent", {})
-                                                    self.log.info(
-                                                        "Contract fulfilled! Credits: %d",
-                                                        ag.get("credits", 0),
-                                                    )
-                                                except SpaceTradersError as e:
-                                                    self.log.warning("Fulfill error: %s", e)
-                                                ctx.done.set()
-                                        return
+                            await self._record_delivery_and_fulfill(result, ctx, good)
+                            if ctx.done.is_set():
+                                return
                             break
                 except SpaceTradersError as e:
                     self.log.warning("Hauler delivery error: %s", e)
@@ -202,10 +183,7 @@ class HaulerRole(BaseRole):
                 await asyncio.sleep(300)
                 continue
 
-            # Navigate to buy market (refuel via base if needed)
-            await self._navigate_with_refuel(self._cfg.asteroid_base)
-            await self._ensure_docked()
-            await self._refuel()
+            # Navigate directly to buy market (refuel en route if needed)
             await self._navigate_with_refuel(buy_wp)
             await self._ensure_docked()
 
@@ -262,27 +240,9 @@ class HaulerRole(BaseRole):
                 result = await contracts_api.deliver_contract(
                     self._client, cid, self.ship_symbol, good, to_deliver
                 )
-                c = result.get("contract", {})
-                for dt in c.get("terms", {}).get("deliver", []):
-                    if dt["tradeSymbol"] == good:
-                        f = dt["unitsFulfilled"]
-                        req = dt["unitsRequired"]
-                        self.log.info("Hauler: %d/%d %s delivered", f, req, good)
-                        if f >= req:
-                            async with ctx.fulfill_lock:
-                                if not ctx.done.is_set():
-                                    try:
-                                        res = await contracts_api.fulfill_contract(self._client, cid)
-                                        ag = res.get("agent", {})
-                                        self.log.info(
-                                            "Contract fulfilled! Credits: %d",
-                                            ag.get("credits", 0),
-                                        )
-                                    except SpaceTradersError as e:
-                                        self.log.warning("Fulfill error: %s", e)
-                                    ctx.done.set()
-                            return
-                        break
+                await self._record_delivery_and_fulfill(result, ctx, good)
+                if ctx.done.is_set():
+                    return
             except SpaceTradersError as e:
                 self.log.warning("Delivery error: %s", e)
                 await asyncio.sleep(30)

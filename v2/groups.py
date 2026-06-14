@@ -72,25 +72,37 @@ def save_groups(groups: list[dict]) -> None:
 # Auto-detection
 # ---------------------------------------------------------------------------
 
-async def auto_group_ships(client, config) -> list[dict]:
+async def auto_group_ships(client, config, force: bool = False) -> list[dict]:
     """Build ship groups from mount types.
 
     Runs when:
+      - force=True, OR
       - 'auto_group_ships' DB setting is '1', OR
-      - No groups currently exist in the DB.
+      - No groups currently exist in the DB, OR
+      - New ungrouped workers have been purchased since last grouping.
 
     Assigns 1 hauler per ~3 workers. Siphon drones group separately from
     mining drones. Saves result to DB and returns the new groups list.
+
+    Caps:
+      - MAX_SIPHON_TEAMS = 2 (v1 parity)
+      - MAX_MINER_TEAMS  = 2 (v1 parity)
     """
     import db
     from api import fleet as fleet_api
 
-    force    = db.get_bot_setting("auto_group_ships", "0") == "1"
+    MAX_SIPHON_TEAMS = 2
+    MAX_MINER_TEAMS  = 2
+
+    db_force = db.get_bot_setting("auto_group_ships", "0") == "1"
     existing = load_groups()
-    if existing and not force:
-        return existing  # manual groups exist — don't override
 
     all_ships = await fleet_api.get_my_ships(client)
+    fleet_symbols = {s["symbol"] for s in all_ships}
+
+    # Validate existing groups — remove ships that no longer exist
+    if existing:
+        existing = validate_groups(existing, fleet_symbols)
 
     def _has_siphon(s: dict) -> bool:
         return any(
@@ -113,6 +125,18 @@ async def auto_group_ships(client, config) -> list[dict]:
         if _has_mining(s)
         and s["symbol"] not in (config.fleet_manager_ship, config.command_ship)
     ]
+
+    # Detect ungrouped workers (new ships bought since last grouping)
+    grouped_workers: set[str] = set()
+    for g in existing:
+        grouped_workers.update(g.get("workers", []))
+    new_siphon = [w for w in siphon_workers if w not in grouped_workers]
+    new_miner  = [w for w in miner_workers  if w not in grouped_workers]
+    has_new_workers = bool(new_siphon or new_miner)
+
+    if existing and not force and not db_force and not has_new_workers:
+        return existing  # manual groups exist and no new workers — don't override
+
     worker_set = set(siphon_workers + miner_workers)
     haulers = [
         s["symbol"] for s in all_ships
@@ -131,7 +155,7 @@ async def auto_group_ships(client, config) -> list[dict]:
     # ── Siphon groups ──────────────────────────────────────────────────────────
     if siphon_workers and remaining:
         n = max(1, (len(siphon_workers) + 2) // 3)  # ~1 hauler per 3 workers
-        n = min(n, len(remaining))
+        n = min(n, len(remaining), MAX_SIPHON_TEAMS)
         s_haulers = remaining[:n]
         remaining = remaining[n:]
         for i, hauler in enumerate(s_haulers):
@@ -147,7 +171,7 @@ async def auto_group_ships(client, config) -> list[dict]:
     # ── Miner groups ────────────────────────────────────────────────────────────
     if miner_workers and remaining:
         n = max(1, (len(miner_workers) + 2) // 3)
-        n = min(n, len(remaining))
+        n = min(n, len(remaining), MAX_MINER_TEAMS)
         m_haulers = remaining[:n]
         for i, hauler in enumerate(m_haulers):
             my_workers = [w for j, w in enumerate(miner_workers) if j % n == i]

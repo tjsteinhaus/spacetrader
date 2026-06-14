@@ -42,8 +42,9 @@ async def navigate(client: "SpaceTradersClient", symbol: str, waypoint_symbol: s
     return await client.post(f"/my/ships/{symbol}/navigate", {"waypointSymbol": waypoint_symbol})
 
 
-async def jump(client: "SpaceTradersClient", symbol: str, waypoint_symbol: str) -> dict:
-    return await client.post(f"/my/ships/{symbol}/jump", {"waypointSymbol": waypoint_symbol})
+async def jump(client: "SpaceTradersClient", symbol: str, system_symbol: str) -> dict:
+    """Jump to a system via jump gate. API expects systemSymbol in body."""
+    return await client.post(f"/my/ships/{symbol}/jump", {"systemSymbol": system_symbol})
 
 
 async def warp(client: "SpaceTradersClient", symbol: str, waypoint_symbol: str) -> dict:
@@ -96,6 +97,11 @@ async def extract(client: "SpaceTradersClient", symbol: str) -> dict:
 
 async def extract_with_survey(client: "SpaceTradersClient", symbol: str, survey: dict) -> dict:
     return await client.post(f"/my/ships/{symbol}/extract/survey", survey)
+
+
+async def refine(client: "SpaceTradersClient", symbol: str, produce: str) -> dict:
+    """Refine raw resources into processed goods using an onboard refinery/processor."""
+    return await client.post(f"/my/ships/{symbol}/refine", {"produce": produce})
 
 
 async def siphon(client: "SpaceTradersClient", symbol: str) -> dict:

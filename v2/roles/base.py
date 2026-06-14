@@ -84,11 +84,131 @@ class BaseRole(ABC):
     async def _refuel(self) -> None:
         await self._nav.refuel_if_needed(self.ship_symbol, threshold=100_000)
 
+    async def _refuel_from_cargo(self) -> bool:
+        """Use FUEL units in cargo to refuel (v1 parity: for siphon ships refining HYDROCARBON).
+        Returns True if any FUEL was used from cargo."""
+        ship = await self._get_ship()
+        fuel_in_cargo = sum(
+            i["units"] for i in ship["cargo"].get("inventory", [])
+            if i["symbol"] == "FUEL"
+        )
+        if fuel_in_cargo <= 0:
+            return False
+        fuel = ship.get("fuel", {})
+        cap  = fuel.get("capacity", 0)
+        cur  = fuel.get("current", 0)
+        need = cap - cur
+        if need <= 0:
+            return False
+        units = min(fuel_in_cargo, need)
+        try:
+            await self._nav.ensure_docked(self.ship_symbol)
+            result = await fleet_api.refuel(self._client, self.ship_symbol, units)
+            f = result.get("fuel", {})
+            self.log.info(
+                "%s refueled from cargo: %d/%d (used %d FUEL units)",
+                self.ship_symbol, f.get("current", cur + units), cap, units,
+            )
+            return True
+        except SpaceTradersError as e:
+            self.log.debug("refuel_from_cargo failed: %s", e)
+            return False
+
     async def _navigate_to(self, destination: str) -> None:
         await self._nav.navigate_to(self.ship_symbol, destination)
 
     async def _navigate_with_refuel(self, destination: str) -> None:
         await self._nav.navigate_with_refuel(self.ship_symbol, destination)
+
+    async def _record_delivery_and_fulfill(
+        self,
+        result: dict,
+        ctx: "ContractContext",
+        good: str,
+    ) -> None:
+        """
+        Parse a deliver_contract API result, update ctx, call db.record_delivery(),
+        and fulfill the contract if all units are delivered. Shared by all roles.
+        """
+        c = result.get("contract", {})
+        for dt in c.get("terms", {}).get("deliver", []):
+            if dt["tradeSymbol"] != good:
+                continue
+            f   = dt["unitsFulfilled"]
+            req = dt["unitsRequired"]
+            prev_f = getattr(ctx, "_last_fulfilled", 0)
+            delivered_this_trip = f - prev_f
+            setattr(ctx, "_last_fulfilled", f)
+            ctx.units_fulfilled = f
+            ctx.units_required  = req
+            self.log.info("%d/%d %s delivered", f, req, good)
+            # Record delivery event in DB (v1 parity)
+            import db as _db
+            try:
+                _db.record_delivery(ctx.contract_id, good, self.ship_symbol, delivered_this_trip, f, req)
+                _db.update_contract_deliverable(ctx.contract_id, good, f)
+            except Exception:
+                pass
+            if f >= req:
+                async with ctx.fulfill_lock:
+                    if not ctx.done.is_set():
+                        try:
+                            from api import contracts as _c_api
+                            res = await _c_api.fulfill_contract(self._client, ctx.contract_id)
+                            ag  = res.get("agent", {})
+                            credits_now = ag.get("credits", 0)
+                            self.log.info("Contract fulfilled! Credits: %d", credits_now)
+                            try:
+                                _db.record_credits(credits_now)
+                                _db.upsert_contract(res.get("contract", c), fulfilled_now=True)
+                            except Exception:
+                                pass
+                        except SpaceTradersError as e:
+                            self.log.warning("Fulfill error: %s", e)
+                        ctx.done.set()
+            break
+        """Refine ores to processed metals when refinement is profitable (v1 parity).
+
+        Uses MODULE_ORE_REFINERY_I or MODULE_GAS_PROCESSOR_I if present.
+        Only refines when refined_price > 10 × raw_price (10:1 yield ratio).
+        """
+        ship = await self._get_ship()
+        modules = {m.get("symbol", "") for m in ship.get("modules", [])}
+        has_refinery = "MODULE_ORE_REFINERY_I" in modules
+        has_gas_proc = "MODULE_GAS_PROCESSOR_I" in modules
+        if not (has_refinery or has_gas_proc):
+            return
+
+        from constants import SMELTED_GOODS
+        inventory = ship["cargo"].get("inventory", [])
+
+        for item in inventory:
+            raw = item["symbol"]
+            refined = next((r for r, o in SMELTED_GOODS.items() if o == raw), None)
+            if not refined:
+                continue
+            # Get best known sell prices for raw and refined
+            raw_price = 0
+            refined_price = 0
+            for wp in (self._market.known_markets or [self._cfg.asteroid_base]):
+                prices = await self._market.get_prices(wp)
+                rp = prices.get(raw, 0)
+                rfp = prices.get(refined, 0)
+                if rp > raw_price:
+                    raw_price = rp
+                if rfp > refined_price:
+                    refined_price = rfp
+            # Refine only when refined is worth more than 10× the raw ore price
+            if raw_price > 0 and refined_price > raw_price * 10:
+                self.log.info(
+                    "Refining %dx %s → %s (raw %d/u, refined %d/u)",
+                    item["units"], raw, refined, raw_price, refined_price,
+                )
+                try:
+                    from api import fleet as _fleet_api
+                    await _fleet_api.refine(self._client, self.ship_symbol, refined)
+                except Exception as e:
+                    self.log.debug("Refine %s→%s failed: %s", raw, refined, e)
 
     async def sell_junk(self, keep_good: str | None = None) -> None:
         """Sell/jettison all cargo except keep_good."""

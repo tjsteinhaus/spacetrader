@@ -81,7 +81,12 @@ class Orchestrator:
                 discord.send_shutdown("KeyboardInterrupt")
                 raise
             except Exception as _e:
-                discord.send_shutdown(f"Unhandled exception: {_e}")
+                # Check for server-reset error codes (v1 parity)
+                _code = getattr(_e, "code", 0)
+                if _code in (4100, 4101, 4109):
+                    discord.send_server_reset()
+                else:
+                    discord.send_shutdown(f"Unhandled exception: {_e}")
                 raise
             finally:
                 self._stop.set()
@@ -201,7 +206,7 @@ class Orchestrator:
                 fulf = d.get("unitsFulfilled", 0)
 
                 try:
-                    db.upsert_contract(contract)
+                    db.upsert_contract(contract, accepted_now=contract.get("accepted", False))
                 except Exception as e:
                     log.debug("Could not persist contract to DB: %s", e)
 
@@ -252,6 +257,12 @@ class Orchestrator:
                         pass
                     await self._cancel_all_tasks()
                     await asyncio.sleep(10)
+                else:
+                    # Contract cycle ended without fulfillment — apply retry-after cooldown
+                    if hasattr(self._strategy, "mark_contract_failed"):
+                        self._strategy.mark_contract_failed(cid)
+                    await self._cancel_all_tasks()
+                    await asyncio.sleep(30)
 
             except asyncio.CancelledError:
                 raise
@@ -422,16 +433,52 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def _status_loop(self) -> None:
-        """Print a fleet status table every 30 seconds."""
-        INTERVAL = 30  # seconds
-        # Short initial wait so startup noise settles first
+        """Print fleet status table every 30 s; send Discord status every N min; detect stuck."""
+        import time as _time
+        PRINT_INTERVAL   = 30       # console print every 30s
+        # Discord status interval read from DB (default 5 min) — v1 parity
+        last_discord_ts  = 0.0
+        last_fulfilled   = -1
+        stuck_warned_ts  = 0.0
+        STUCK_WINDOW     = 1800     # 30 min without delivery progress = stuck
         await asyncio.sleep(5)
         while not self._stop.is_set():
             try:
                 await self._print_status_table()
+
+                # ── Discord periodic status ──────────────────────────────────
+                discord_interval_secs = int(db.get_bot_setting("discord_status_interval", "300"))
+                now_ts = _time.time()
+                if now_ts - last_discord_ts >= discord_interval_secs:
+                    try:
+                        ships = await self._client.get_all_pages("/my/ships")
+                        agent = await self._client.get("/my/agent")
+                        cph   = db.get_cph(3600)
+                        discord.send_status(ships, agent, cph, discord_interval_secs // 60)
+                        last_discord_ts = now_ts
+                    except Exception:
+                        pass
+
+                # ── Stuck detection ──────────────────────────────────────────
+                ctx = self._current_ctx
+                if ctx is not None and not ctx.done.is_set():
+                    cur_fulfilled = ctx.units_fulfilled
+                    if cur_fulfilled != last_fulfilled:
+                        last_fulfilled  = cur_fulfilled
+                        stuck_warned_ts = now_ts
+                    elif now_ts - stuck_warned_ts > STUCK_WINDOW:
+                        msg = (
+                            f"No delivery progress for {STUCK_WINDOW // 60} min "
+                            f"on contract {ctx.contract_id} "
+                            f"({ctx.units_fulfilled}/{ctx.units_required} {ctx.trade_symbol})"
+                        )
+                        log.warning("[STUCK] %s", msg)
+                        discord.send_stuck(msg)
+                        stuck_warned_ts = now_ts  # re-arm; will warn again after another window
+
             except Exception as e:
-                log.debug("Status table error: %s", e)
-            await asyncio.sleep(INTERVAL)
+                log.debug("Status loop error: %s", e)
+            await asyncio.sleep(PRINT_INTERVAL)
 
     async def _print_status_table(self) -> None:
         """Fetch live ship data and log a summary table."""

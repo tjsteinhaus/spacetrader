@@ -101,14 +101,22 @@ class Config:
         # Load from DB if already configured for this callsign
         saved = db.load_agent_config(self.callsign)
         if saved.get("ASTEROID"):
-            self.asteroid = saved["ASTEROID"]
-            self.asteroid_base = saved.get("ASTEROID_BASE", self.asteroid_base or hq)
-            self.shipyard_wp = saved.get("SHIPYARD_WP", self.shipyard_wp or hq)
-            raw_wps = saved.get("SHIPYARD_WPS", "")
-            self.shipyard_wps = raw_wps.split(",") if raw_wps else [self.shipyard_wp]
-            self.faction_hq_wp = saved.get("FACTION_HQ_WP", hq)
-            print(f"[config] Loaded from DB: ASTEROID={self.asteroid} BASE={self.asteroid_base}")
-            return
+            # Validate saved config belongs to current system (v1 parity: server reset detection)
+            if not saved["ASTEROID"].startswith(self.system + "-"):
+                print(
+                    f"[config] Saved ASTEROID {saved['ASTEROID']!r} is from a different system "
+                    f"(current: {self.system}) — discarding stale config and re-detecting"
+                )
+                saved = {}
+            else:
+                self.asteroid = saved["ASTEROID"]
+                self.asteroid_base = saved.get("ASTEROID_BASE", self.asteroid_base or hq)
+                self.shipyard_wp = saved.get("SHIPYARD_WP", self.shipyard_wp or hq)
+                raw_wps = saved.get("SHIPYARD_WPS", "")
+                self.shipyard_wps = raw_wps.split(",") if raw_wps else [self.shipyard_wp]
+                self.faction_hq_wp = saved.get("FACTION_HQ_WP", hq)
+                print(f"[config] Loaded from DB: ASTEROID={self.asteroid} BASE={self.asteroid_base}")
+                return
 
         # First run — detect by scoring waypoints
         try:

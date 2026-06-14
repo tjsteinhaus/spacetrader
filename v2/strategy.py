@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable, TYPE_CHECKING
 
@@ -44,6 +46,71 @@ class ContractGrindStrategy:
         self.min_payout = min_payout
         # e.g. {"TYLERMASTERY2-5": "trader"} — pinned regardless of contract state
         self.ship_role_overrides: dict[str, str] = ship_role_overrides or {}
+        # Per-contract retry-after cooldown: {contract_id: unix_ts_retry_after}
+        # Prevents the bot from hammering an unworkable contract forever.
+        self._contract_retry_after: dict[str, float] = {}
+        # Timestamp of last contract negotiation (for 24h proactive re-negotiation)
+        self._last_negotiation: float = 0.0
+
+    def mark_contract_failed(self, contract_id: str, cooldown_secs: float = 600.0) -> None:
+        """Call when a contract can't be worked. Suppresses it for cooldown_secs."""
+        self._contract_retry_after[contract_id] = time.monotonic() + cooldown_secs
+        log.warning("Contract %s marked failed — suppressing for %.0fs", contract_id, cooldown_secs)
+
+    def _is_contract_on_cooldown(self, contract_id: str) -> bool:
+        retry_after = self._contract_retry_after.get(contract_id, 0.0)
+        return time.monotonic() < retry_after
+
+    def _is_deadline_to_accept_expired(self, contract: dict) -> bool:
+        """Return True if the contract's deadlineToAccept has passed."""
+        dta = contract.get("deadlineToAccept")
+        if not dta:
+            return False
+        try:
+            dt = datetime.fromisoformat(dta.replace("Z", "+00:00"))
+            return dt < datetime.now(timezone.utc)
+        except Exception:
+            return False
+
+    def _contract_score(self, contract: dict, cfg: "Config") -> float:
+        """Score a contract for prioritisation (v1 parity).
+
+        Higher = work this contract sooner.
+        Factors:
+        - Payout per unit remaining (efficiency)
+        - +20% bonus if the good is mineable
+        - -15% penalty if the good is NOT mineable (must buy from market)
+        - Distance penalty for far delivery waypoints
+        """
+        terms    = contract.get("terms", {})
+        payment  = terms.get("payment", {})
+        payout   = payment.get("onFulfilled", 0)
+        delivers = terms.get("deliver", [{}])
+        d         = delivers[0] if delivers else {}
+        required  = d.get("unitsRequired", 1) or 1
+        fulfilled = d.get("unitsFulfilled", 0)
+        remaining = max(1, required - fulfilled)
+        good      = d.get("tradeSymbol", "")
+        dest      = d.get("destinationSymbol", "")
+
+        score = payout / remaining  # payout-per-unit
+
+        from constants import MINEABLE_GOODS
+        if good in MINEABLE_GOODS:
+            score *= 1.20   # +20% resource match bonus
+        else:
+            score *= 0.85   # -15% non-mineable penalty
+
+        # Distance penalty using DB coords
+        if dest and cfg.asteroid_base:
+            import db as _db
+            dest_c = _db.get_waypoint_coords(dest)
+            base_c = _db.get_waypoint_coords(cfg.asteroid_base)
+            if dest_c and base_c:
+                dist = ((dest_c[0] - base_c[0]) ** 2 + (dest_c[1] - base_c[1]) ** 2) ** 0.5
+                score -= dist * 0.05
+
+        return score
 
     async def select_contract(self, client: "SpaceTradersClient", cfg: "Config", navigator=None) -> dict | None:
         from api import contracts as contracts_api
@@ -54,22 +121,35 @@ class ContractGrindStrategy:
             log.warning("Could not fetch contracts: %s", e)
             return None
 
-        # Prefer accepted+unfulfilled contracts first
-        active = [c for c in all_contracts if c.get("accepted") and not c.get("fulfilled")]
+        # Prefer accepted+unfulfilled contracts first (skip ones on cooldown)
+        active = [
+            c for c in all_contracts
+            if c.get("accepted") and not c.get("fulfilled")
+            and not self._is_contract_on_cooldown(c.get("id", ""))
+        ]
         if active:
-            return max(active, key=lambda c: c.get("terms", {}).get("payment", {}).get("onFulfilled", 0))
+            best_active = max(active, key=lambda c: self._contract_score(c, cfg))
+            # Proactive re-negotiation: if we've been running >24h without negotiating,
+            # finish this contract then pre-queue a new one (v1 parity).
+            if time.monotonic() - self._last_negotiation > 86400:
+                log.info("24h since last negotiation — will pre-negotiate after current contract")
+                # Don't interrupt — just note it; orchestrator will call us again when done.
+            return best_active
 
-        # Accept the best available (already offered) contract
+        # Accept the best available (already offered) contract — use _contract_score ranking
         available = [
             c for c in all_contracts
             if not c.get("accepted") and not c.get("fulfilled")
             and c.get("terms", {}).get("payment", {}).get("onFulfilled", 0) >= self.min_payout
+            and not self._is_deadline_to_accept_expired(c)
+            and not self._is_contract_on_cooldown(c.get("id", ""))
         ]
         if available:
-            best = max(available, key=lambda c: c.get("terms", {}).get("payment", {}).get("onFulfilled", 0))
+            best = max(available, key=lambda c: self._contract_score(c, cfg))
             try:
                 result = await contracts_api.accept_contract(client, best["id"])
                 accepted = result.get("contract", best)
+                self._last_negotiation = time.monotonic()
                 log.info(
                     "Accepted contract %s: %s for %d cr",
                     accepted.get("id"), accepted.get("type"),
@@ -102,11 +182,16 @@ class ContractGrindStrategy:
                 await fleet_api.dock(client, ship_symbol)
             result = await contracts_api.negotiate_contract(client, ship_symbol)
             new_contract = result.get("contract", {})
+            self._last_negotiation = time.monotonic()
             log.info(
                 "Negotiated contract %s: %s for %d cr",
                 new_contract.get("id"), new_contract.get("type"),
                 new_contract.get("terms", {}).get("payment", {}).get("onFulfilled", 0),
             )
+            # Check deadlineToAccept before accepting
+            if self._is_deadline_to_accept_expired(new_contract):
+                log.warning("Negotiated contract %s already past deadlineToAccept — skipping", new_contract.get("id"))
+                return None
             # Accept it immediately
             accepted = await contracts_api.accept_contract(client, new_contract["id"])
             c = accepted.get("contract", new_contract)

@@ -75,7 +75,7 @@ SHIP_SCORES: dict[str, int] = {
     "SHIP_ORE_HOUND":        15,  # Miner — lower priority until groups prove out
     "SHIP_SURVEYOR":         -1,  # Skip — buy goods from market, don't mine
     "SHIP_HEAVY_FREIGHTER":  -1,  # Never buy
-    "SHIP_COMMAND_FRIGATE":  -1,  # Already have one
+    "SHIP_COMMAND_FRIGATE":  45,  # Buy 2nd frigate at 1.5M cr gate (v1 parity)
     "SHIP_GAS_DRONE":        -1,  # Never buy
     "SHIP_LIGHT_SHUTTLE":    -1,  # Never buy — tiny cargo, wrong role
 }
@@ -133,8 +133,8 @@ ASTEROID_TYPES: frozenset[str] = frozenset({
 })
 
 # Default tunables (overridden by Config).
-DEFAULT_CREDIT_RESERVE      = 20_000
-DEFAULT_MIN_BUY_CREDITS     = 20_000
+DEFAULT_CREDIT_RESERVE      = 500_000   # never spend below this (v1 parity)
+DEFAULT_MIN_BUY_CREDITS     = 600_000   # fleet manager activates above this (v1 parity)
 DEFAULT_REPAIR_THRESHOLD    = 0.80
 DEFAULT_MIN_SELL_PRICE      = 30
 DEFAULT_MARKET_CACHE_TTL    = 600
@@ -142,12 +142,13 @@ DEFAULT_DRY_EXTRACT_THRESHOLD = 5
 DEFAULT_CHEAP_BUY_THRESHOLD = 200
 DEFAULT_SELL_ROUTING_DIST_COST = 20
 DEFAULT_MIN_CONTRACT_PAYOUT = 30_000
-DEFAULT_MIN_FUEL_CAPACITY   = 150
+DEFAULT_MIN_FUEL_CAPACITY   = 80        # skip ships with fuel cap below this
 
 # Team composition / purchase caps.
 MAX_TRADERS               = 3           # free (non-group) haulers dedicated to arbitrage
 PROBE_CREDIT_THRESHOLD    = 1_000_000   # don't buy probes until we have this many credits
 MAX_PROBES                = 10          # max probe fleet (one per reachable system)
+FRIGATE_CREDIT_THRESHOLD  = 1_500_000   # buy a 2nd command frigate at this balance (v1 parity)
 
 # Hauler departure thresholds.
 HAULER_DEPART_FRACTION   = 0.50   # leave when cargo >= 50% full

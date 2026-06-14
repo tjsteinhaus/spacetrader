@@ -12,7 +12,7 @@ from client import SpaceTradersError
 from api import fleet as fleet_api
 import db
 from .base import BaseRole
-from .miner import _asteroid_cache, _active_mining_wp as _mwp_ref  # noqa: F401 — re-exported
+from .miner import _asteroid_cache  # shared asteroid scoring cache
 
 
 class SurveyorRole(BaseRole):

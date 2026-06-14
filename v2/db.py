@@ -433,10 +433,11 @@ def upsert_market_prices(
             )
 
 
-def upsert_contract(contract: dict[str, Any], path: Path | str | None = None) -> None:
+def upsert_contract(contract: dict[str, Any], accepted_now: bool = False, fulfilled_now: bool = False, path: Path | str | None = None) -> None:
     """
     Upsert a contract and its deliverables from a contracts_api response dict.
-    accepted_at and fulfilled_at are set once on first transition and never overwritten.
+    accepted_at and fulfilled_at are set ONLY when accepted_now/fulfilled_now=True,
+    never on passive reloads. Use COALESCE so existing timestamps are never overwritten.
     """
     now = time.time()
     cid = contract.get("id", "")
@@ -444,8 +445,9 @@ def upsert_contract(contract: dict[str, Any], path: Path | str | None = None) ->
         return
     terms = contract.get("terms", {})
     payment = terms.get("payment", {})
-    accepted_at  = now if contract.get("accepted")  else None
-    fulfilled_at = now if contract.get("fulfilled") else None
+    # Only stamp a timestamp when the bot is actively performing the action
+    accepted_at  = now if accepted_now  else None
+    fulfilled_at = now if fulfilled_now else None
     with _conn(path) as con:
         con.execute(
             """INSERT INTO contracts
@@ -586,11 +588,15 @@ def log_extraction(
 
 
 def record_credits(credits: int, path: Path | str | None = None) -> None:
-    """Append a credits snapshot for CPH tracking and the analytics chart."""
+    """Append a credits snapshot for CPH tracking. Pruned to last 43200 entries (v1 parity)."""
     with _conn(path) as con:
         con.execute(
             "INSERT INTO credits_history (credits, timestamp) VALUES (?, ?)",
             (credits, time.time()),
+        )
+        con.execute(
+            "DELETE FROM credits_history WHERE id NOT IN "
+            "(SELECT id FROM credits_history ORDER BY id DESC LIMIT 43200)"
         )
 
 
@@ -624,12 +630,17 @@ def get_cph(window_secs: int = 3600, path: Path | str | None = None) -> int:
 
 
 def write_log(msg: str, path: Path | str | None = None) -> None:
-    """Append a log message to bot_logs (non-blocking best-effort)."""
+    """Append a log message to bot_logs (non-blocking best-effort). Pruned to 2000 entries."""
     try:
         with _conn(path) as con:
             con.execute(
                 "INSERT INTO bot_logs (message, timestamp) VALUES (?, ?)",
                 (msg, time.time()),
+            )
+            # Prune to last 2000 entries (v1 parity)
+            con.execute(
+                "DELETE FROM bot_logs WHERE id NOT IN "
+                "(SELECT id FROM bot_logs ORDER BY id DESC LIMIT 2000)"
             )
     except Exception:
         pass

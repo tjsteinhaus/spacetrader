@@ -65,7 +65,7 @@ class SiphonerRole(BaseRole):
                     ),
                     default=0,
                 )
-                if best_price < 30:
+                if best_price < self._cfg.min_sell_price:
                     try:
                         await fleet_api.jettison(self._client, self.ship_symbol, sym, item["units"])
                         self.log.info("Jettisoned %dx %s (%d cr/u)", item["units"], sym, best_price)
@@ -104,16 +104,7 @@ class SiphonerRole(BaseRole):
                                 self._client, ctx.contract_id, self.ship_symbol,
                                 contract_good, have
                             )
-                            c = result.get("contract", {})
-                            for dt in c.get("terms", {}).get("deliver", []):
-                                if dt["tradeSymbol"] == contract_good:
-                                    f = dt["unitsFulfilled"]
-                                    req = dt["unitsRequired"]
-                                    ctx.units_fulfilled = f
-                                    ctx.units_required = req
-                                    self.log.info("%d/%d %s delivered", f, req, contract_good)
-                                    if f >= req:
-                                        ctx.done.set()
+                            await self._record_delivery_and_fulfill(result, ctx, contract_good)
                         except SpaceTradersError as e:
                             self.log.warning("Delivery error: %s", e)
                 await self._navigate_with_refuel(self._cfg.asteroid_base)

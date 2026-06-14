@@ -10,7 +10,7 @@ import logging
 from client import SpaceTradersError
 from api import fleet as fleet_api, agent as agent_api, universe as universe_api
 import db
-from constants import SHIP_SCORES, MINING_MOUNT_TIERS, NO_DRIFT_DIST_MAX, MAX_TRADERS, PROBE_CREDIT_THRESHOLD, MAX_PROBES
+from constants import SHIP_SCORES, MINING_MOUNT_TIERS, NO_DRIFT_DIST_MAX, MAX_TRADERS, PROBE_CREDIT_THRESHOLD, MAX_PROBES, FRIGATE_CREDIT_THRESHOLD
 from .base import BaseRole
 
 
@@ -68,7 +68,13 @@ class FleetManagerRole(BaseRole):
             if self._cfg.auto_buy_enabled():
                 await self._buy_ships()
 
-            # 4. Scan the highest-priority stale market to keep arbitrage DB fresh
+            # 4. Process scrap queue (v1 parity: ships queued via dashboard/bot_settings)
+            await self._step_scrap_pending()
+
+            # 5. Proactively pre-negotiate next contract when < 2 unfulfilled exist (v1 parity)
+            await self._bg_negotiate_contract()
+
+            # 6. Scan the highest-priority stale market to keep arbitrage DB fresh
             await self._scan_next_market()
 
             # Sleep between management cycles
@@ -171,6 +177,9 @@ class FleetManagerRole(BaseRole):
             and s["symbol"] not in grouped_haulers
             and s["symbol"] != self._cfg.fleet_manager_ship
         )
+        # Dynamic MAX_TRADERS: scale with known market count (v1 parity), floor 3
+        _known_market_count = len(self._market.known_markets or [])
+        effective_max_traders = max(MAX_TRADERS, _known_market_count // 5)
 
         for shipyard_wp in self._cfg.shipyard_wps:
             try:
@@ -189,10 +198,8 @@ class FleetManagerRole(BaseRole):
                         return -1
                     if stype == "SHIP_LIGHT_HAULER":
                         # Keep buying haulers until teams are full AND we have enough traders
-                        need_trader = free_hauler_count < MAX_TRADERS
+                        need_trader = free_hauler_count < effective_max_traders
                         if not need_trader:
-                            # Check if teams still need a hauler (handled below in group logic;
-                            # here we do a simple pass-through and let group gating decide)
                             pass  # always allow if a team needs a hauler
                     if stype == "SHIP_MINING_DRONE":
                         if not _is_mining_drone_safe(self._cfg.asteroid, self._market):
@@ -214,6 +221,10 @@ class FleetManagerRole(BaseRole):
                             return -1
                         if probe_count >= MAX_PROBES:
                             return -1
+                    if stype == "SHIP_COMMAND_FRIGATE":
+                        # Only buy a 2nd frigate when wealthy enough (v1 parity: 1.5M gate)
+                        if credits < FRIGATE_CREDIT_THRESHOLD:
+                            return -1
                     return base
 
                 scored = sorted(
@@ -230,6 +241,16 @@ class FleetManagerRole(BaseRole):
                         continue
                     if credits - purchase_price < self._cfg.credit_reserve:
                         continue
+                    # Skip ships with fuel capacity below the configured minimum (v1 parity)
+                    fuel_cap = ship_info.get("frame", {}).get("moduleSlots", 0)
+                    # Use reactor fuel from ship_info if available; otherwise estimate from type
+                    ship_fuel_cap = ship_info.get("fuel", {}).get("capacity", 999)
+                    if ship_fuel_cap < self._cfg.min_fuel_capacity and ship_fuel_cap > 0:
+                        self.log.debug(
+                            "%s skipped — fuel cap %d < min %d",
+                            ship_type, ship_fuel_cap, self._cfg.min_fuel_capacity,
+                        )
+                        continue
 
                     # Check if a custom target list restricts purchases
                     targets = self._cfg.get_ship_targets()
@@ -238,13 +259,12 @@ class FleetManagerRole(BaseRole):
                         if not matching:
                             continue
                         current_ships = await fleet_api.get_my_ships(self._client)
+                        # Count ships of the same frame type by checking the frame symbol
+                        # (registration.role is a role category like "HAULER", not ship type)
+                        _type_suffix = ship_type.replace("SHIP_", "")
                         existing_count = sum(
                             1 for s in current_ships
-                            if s.get("registration", {}).get("role", "") == ship_type
-                            or any(
-                                m.get("symbol", "").startswith(ship_type.replace("SHIP_", ""))
-                                for m in s.get("mounts", [])
-                            )
+                            if _type_suffix in s.get("frame", {}).get("symbol", "").replace("FRAME_", "")
                         )
                         if existing_count >= matching.get("max", 99):
                             continue
@@ -264,7 +284,10 @@ class FleetManagerRole(BaseRole):
                         hauler_count      += 1 if "HAULER" in ship_type or "FREIGHTER" in ship_type else 0
                         miner_count       += 1 if "MINING" in ship_type or "ORE" in ship_type else 0
                         probe_count       += 1 if ship_type == "SHIP_PROBE" else 0
-                        free_hauler_count += 1 if "HAULER" in ship_type or "FREIGHTER" in ship_type else 0
+                        # Only increment free_hauler_count if this hauler won't be auto-grouped
+                        # (i.e. we still need free traders under MAX_TRADERS threshold)
+                        if "HAULER" in ship_type or "FREIGHTER" in ship_type:
+                            free_hauler_count += 1
                         self.log.info("Purchased %s! Credits now: %d", new_sym, credits)
                         break  # one purchase per shipyard per cycle
                     except SpaceTradersError as e:
@@ -274,6 +297,78 @@ class FleetManagerRole(BaseRole):
             except SpaceTradersError as e:
                 self.log.debug("Shipyard %s: %s", shipyard_wp, e)
 
+
+    async def _bg_negotiate_contract(self) -> None:
+        """Proactively negotiate a new contract when fewer than 2 unfulfilled contracts exist.
+
+        This pre-queues the next contract so it's ready the moment the current one completes.
+        Mirrors v1 fleet_manager_loop's _bg_negotiate_contract() behavior.
+        """
+        active = db.get_active_contracts()
+        unfulfilled = [c for c in active if not c.get("fulfilled")]
+        if len(unfulfilled) >= 2:
+            return  # already have enough queued
+        from api import contracts as contracts_api, fleet as _fleet_api
+        cmd_ship = self._cfg.command_ship
+        try:
+            ship = await _fleet_api.get_ship(self._client, cmd_ship)
+            if ship.get("nav", {}).get("status") == "IN_TRANSIT":
+                return
+            hq_wp = self._cfg.faction_hq_wp
+            if ship["nav"]["waypointSymbol"] != hq_wp:
+                await self._nav.navigate_with_refuel(cmd_ship, hq_wp)
+            await self._nav.ensure_docked(cmd_ship)
+            result = await contracts_api.negotiate_contract(self._client, cmd_ship)
+            new_c = result.get("contract", {})
+            if new_c.get("id"):
+                self.log.info(
+                    "Pre-negotiated contract %s: %s for %d cr",
+                    new_c["id"], new_c.get("type"),
+                    new_c.get("terms", {}).get("payment", {}).get("onFulfilled", 0),
+                )
+                db.upsert_contract(new_c)
+        except SpaceTradersError as e:
+            if e.code not in (4511, 4511):  # 4511 = already has active contract
+                self.log.debug("bg_negotiate: %s", e)
+        except Exception as e:
+            self.log.debug("bg_negotiate failed: %s", e)
+
+    async def _step_scrap_pending(self) -> None:
+        """Process ships queued for scrapping via the 'pending_scrap' DB bot_setting (v1 parity).
+
+        The dashboard or operator sets: db.set_bot_setting('pending_scrap', 'SHIP-A,SHIP-B')
+        The fleet manager navigates each ship to a shipyard and scraps it.
+        """
+        raw = db.get_bot_setting("pending_scrap", "")
+        if not raw.strip():
+            return
+        symbols = [s.strip() for s in raw.split(",") if s.strip()]
+        if not symbols:
+            return
+        self.log.info("Scrap queue: %s", symbols)
+        remaining: list[str] = []
+        for sym in symbols:
+            try:
+                ship = await fleet_api.get_ship(self._client, sym)
+                if ship.get("nav", {}).get("status") == "IN_TRANSIT":
+                    remaining.append(sym)
+                    continue
+                self.log.info("Scrapping %s — navigating to shipyard", sym)
+                await self._nav.navigate_with_refuel(sym, self._cfg.shipyard_wp)
+                await self._nav.ensure_docked(sym)
+                result = await fleet_api.scrap(self._client, sym)
+                tx = result.get("transaction", {})
+                scrap_val = tx.get("totalPrice", tx.get("totalCost", 0))
+                self.log.info(
+                    "Scrapped %s for %d cr", sym, scrap_val
+                )
+                import discord_notify as discord
+                discord.send_scrap(sym, scrap_val)
+            except SpaceTradersError as e:
+                self.log.warning("Scrap %s failed: %s", sym, e)
+                remaining.append(sym)
+        # Update the setting — remove scrapped ships
+        db.set_bot_setting("pending_scrap", ",".join(remaining))
 
     async def _scan_next_market(self, staleness: float = 7_200.0) -> None:
         """Navigate to the highest-priority stale/unvisited market and refresh live prices.

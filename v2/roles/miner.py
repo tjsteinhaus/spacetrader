@@ -276,6 +276,10 @@ class MinerRole(BaseRole):
             empty_loads = 0
             dry_extractions = 0
 
+        # Refuel threshold depends on tank size (v1 parity: small tanks refuel at 60%)
+        _small_tank = fuel_cap <= 80
+        _low_fuel_threshold = 0.60 if _small_tank else 0.40
+
         while not stop.is_set() and not ctx.done.is_set():
             # Refresh survey from shared pool
             if active_survey is None and use_shared_surveys:
@@ -290,7 +294,7 @@ class MinerRole(BaseRole):
             # Refuel if needed (not while at asteroid — mining is free)
             fuel_cap2 = fuel.get("capacity", 0)
             if not at_asteroid and not at_buy_wp and fuel_cap2 > 0:
-                if fuel.get("current", 0) / fuel_cap2 < 0.40:
+                if fuel.get("current", 0) / fuel_cap2 < _low_fuel_threshold:
                     self.log.info("Fuel low, topping up at base")
                     await self._navigate_with_refuel(self._cfg.asteroid_base)
                     await self._ensure_docked()
@@ -426,6 +430,9 @@ class MinerRole(BaseRole):
                     cargo_now.get("units", 0), cargo_now.get("capacity", 1),
                     cd,
                 )
+                # Log any events (asteroid damage, etc.) — v1 parity
+                for ev in result.get("events", []):
+                    self.log.info("Event: %s", ev)
                 if yld.get("symbol") == good:
                     dry_extractions = 0
                 else:
@@ -439,7 +446,25 @@ class MinerRole(BaseRole):
                     )
                 await self._nav.wait_cooldown(self.ship_symbol)
             except SpaceTradersError as e:
-                if e.code != 4228:  # 4228 = cargo full, handled above
+                if e.code == 4228:
+                    pass  # cargo full — handled above
+                elif e.code == 4243:
+                    # No mining laser — permanent error, exit miner loop
+                    self.log.error("Ship %s has no mining laser — exiting miner loop", self.ship_symbol)
+                    return
+                elif e.code == 4236:
+                    # Not in orbit — re-orbit and retry
+                    self.log.warning("Not in orbit (4236) — re-orbiting")
+                    try:
+                        await self._ensure_orbit()
+                    except SpaceTradersError:
+                        pass
+                elif e.code == 4205:
+                    # Wrong waypoint type — navigate back to asteroid
+                    self.log.warning("Wrong waypoint type (4205) — returning to asteroid")
+                    await self._navigate_with_refuel(mining_target)
+                    await self._ensure_orbit()
+                else:
                     self.log.error("Extract error: %s", e)
                     await asyncio.sleep(5)
 
@@ -594,6 +619,12 @@ class MinerRole(BaseRole):
             # Force cache refresh while docked
             prices = await self._market.get_prices(buy_wp)
             buy_price = prices.get(good, 0)
+
+        if buy_price <= 0:
+            # Good absent from live tradeGoods — blacklist this market for 20 min (v1 parity)
+            self.log.warning("%s not available at %s — blacklisting for 20 min", good, buy_wp)
+            await self._market.blacklist(buy_wp, 1200)
+            return
 
         if buy_price > 0:
             try:
