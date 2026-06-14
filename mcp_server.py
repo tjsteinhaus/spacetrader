@@ -32,11 +32,12 @@ from client import SpaceTradersError
 load_dotenv()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-SYSTEM        = "X1-HU91"
-COMMAND_SHIP  = "TYLERMASTERY-1"
-SHIPYARD_WP   = "X1-HU91-H52"
-HQ_WP         = "X1-HU91-A1"
-ASTEROID      = "X1-HU91-B8"
+# NOTE: Update these for each server reset
+SYSTEM        = "X1-BX78"
+COMMAND_SHIP  = "TYLERDEVRUN-1"
+SHIPYARD_WP   = "X1-BX78-A2"
+HQ_WP         = "X1-BX78-A1"
+ASTEROID      = "X1-BX78-C44"
 STRATEGY_FILE = Path(__file__).parent / "strategy.json"
 
 VALID_MODES = {"contract_grind", "fleet_expansion", "upgrade_first", "idle"}
@@ -139,7 +140,7 @@ def get_situation() -> dict:
 def get_market_prices(waypoints: list[str] | None = None) -> dict:
     """
     Return live market prices at the specified waypoints (or all known markets
-    in X1-HU91 if none provided).
+    in the current system if none provided).
 
     Returns: {waypoint: {trade_symbol: {sell, buy, supply, trade_volume}}}
 
@@ -187,7 +188,7 @@ def get_market_prices(waypoints: list[str] | None = None) -> dict:
 @mcp.tool()
 def get_shipyard() -> dict:
     """
-    Return current ship listings and prices at the shipyard (X1-HU91-H52).
+    Return current ship listings and prices at the shipyard (X1-BX78-A2).
 
     Includes ship type, purchase price, available mounts, frame, and whether
     it has mining or survey capability. Use this to decide which ships to buy next.
@@ -427,8 +428,8 @@ def set_strategy(
 @mcp.tool()
 def negotiate_new_contract() -> dict:
     """
-    Command the command ship (TYLERMASTERY-1) to navigate to the faction HQ
-    (X1-HU91-A1), dock, and negotiate a new contract.
+    Command the command ship (TYLERDEVRUN-1) to navigate to the faction HQ
+    (X1-BX78-A1), dock, and negotiate a new contract.
 
     Use this when play.py is stuck with no contracts, or when you want to
     pre-queue a contract before the current one finishes.
